@@ -202,8 +202,9 @@ fn icon(state: IconState, size: i32) -> Option<ksni::Icon> {
     // the tray wants straight ARGB bytes in network order.
     let mut argb = Vec::with_capacity(width * height * 4);
     for row in 0..height {
-        for pixel in data[row * stride..row * stride + width * 4].chunks_exact(4) {
-            let value = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        let (pixels, _) = data[row * stride..row * stride + width * 4].as_chunks::<4>();
+        for pixel in pixels {
+            let value = u32::from_ne_bytes(*pixel);
             let [alpha, red, green, blue] = value.to_be_bytes();
             let straight = |channel: u8| {
                 if alpha == 0 {
