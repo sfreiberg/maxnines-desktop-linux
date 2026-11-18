@@ -462,14 +462,16 @@ fn info_row(title: &str, value: &str) -> adw::ActionRow {
     row
 }
 
-/// A coloured mark at the start of a row, named for screen readers.
+/// A coloured mark at the start of a row, with what it means.
 fn mark(text: &str, class: &str, name: &str) -> gtk::Label {
     let label = gtk::Label::builder()
         .label(text)
         .css_classes([class])
         .valign(gtk::Align::Center)
         .build();
-    label.update_property(&[gtk::accessible::Property::Label(name)]);
+    // Naming it for screen readers takes GTK 4.10; a tooltip works from 4.6, and
+    // says what the colour means to anyone.
+    label.set_tooltip_text(Some(name));
     label
 }
 
