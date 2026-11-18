@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MaxNines Desktop
+GenericName=Monitoring alerts
+Comment=Your MaxNines server's alerts
+Exec=maxnines-desktop
+Icon=com.maxnines.Desktop
+Terminal=false
+Categories=Network;Monitor;System;
+Keywords=MaxNines;monitoring;alerts;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

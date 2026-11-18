@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The kit needs nothing from the desktop, so it's tested on its own too.
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest GTK 4.6 and libadwaita 1.1 the app supports.
+          - { name: Ubuntu 22.04, runner: ubuntu-22.04 }
+          - { name: Ubuntu 24.04, runner: ubuntu-24.04 }
+          - { name: Ubuntu 24.04 Arm, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install GTK and libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        if: matrix.runner != 'ubuntu-22.04'
+        with:
+          name: maxnines-desktop-${{ matrix.runner == 'ubuntu-24.04-arm' && 'aarch64' || 'x86_64' }}
+          path: target/release/maxnines-desktop
+          retention-days: 14
