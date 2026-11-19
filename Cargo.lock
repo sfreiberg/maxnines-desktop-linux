@@ -1244,7 +1244,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "maxnines-desktop"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-channel",
  "gethostname",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-desktop-kit"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64",
  "ring",
