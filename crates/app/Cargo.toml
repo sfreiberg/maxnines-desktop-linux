@@ -16,7 +16,6 @@ keyring = "4.2.0"
 # Blocking, on its own thread, with no async runtime of ours to share.
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 maxnines-desktop-kit.workspace = true
-notify-rust = "4.19.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 

@@ -22,7 +22,8 @@ sudo dnf install ./maxnines-desktop-*.rpm     # Fedora, RHEL 10, Rocky, Alma
 Either one installs what it needs, and adds MaxNines Desktop to your applications.
 For anything else, the `.tar.gz` has the program, its desktop entry and icon: put
 `maxnines-desktop` on your `PATH`, and the other two in
-`~/.local/share/applications` and `~/.local/share/icons/hicolor/scalable/apps`.
+`~/.local/share/applications` and `~/.local/share/icons/hicolor/scalable/apps`. GNOME
+only shows its notifications once the desktop entry is there.
 
 ## The tray icon
 
@@ -81,6 +82,8 @@ Each starts with the circle MaxNines uses in Discord: red for critical, yellow f
 warning, and green once it's resolved. A resolved one says where things stand, such as
 "web-1 is back online", and how long the problem lasted. A notification about an alert
 that's started has Acknowledge, which needs the responder role, and Open in MaxNines.
+Once the app has signed in again or restarted, an older notification's buttons open its
+window instead, so they never act on a different sign-in.
 
 ## Open at login
 

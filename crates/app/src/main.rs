@@ -19,8 +19,8 @@ use gtk::glib;
 /// The app's ID, for the desktop: its desktop entry, its icon and its notifications.
 pub const APP_ID: &str = "com.maxnines.Desktop";
 
-/// What the tray, notifications and threads ask the app to do. They run outside GTK's
-/// thread, so they send it here rather than touch the window.
+/// What the tray and threads ask the app to do. They run outside GTK's thread, so
+/// they send it here rather than touch the window.
 #[derive(Debug, Clone)]
 pub enum Command {
     /// Show the window.
@@ -31,8 +31,6 @@ pub enum Command {
     Open(String),
     /// Open a whole address, such as the sign-in page.
     OpenUrl(String),
-    /// Acknowledge an alert from its notification, which says if that didn't work.
-    AcknowledgeFromNotice(i64),
     /// A refresh brought new tokens, or the sign-in ended: who's signed in now, for
     /// the connection it happened on.
     SignedInAs(u64, Option<(String, String)>),
@@ -47,8 +45,21 @@ fn main() -> glib::ExitCode {
     }
     // Started at sign-in, it waits in the tray rather than opening its window.
     let background = std::env::args().any(|argument| argument == "--background");
+    glib::set_application_name("MaxNines Desktop");
     let app = adw::Application::builder().application_id(APP_ID).build();
     let shared: Rc<RefCell<Option<store::Shared>>> = Rc::default();
+    {
+        let shared = shared.clone();
+        notify::add_actions(&app, move |app, pressed| {
+            let store = shared.borrow().clone();
+            match store {
+                Some(store) => store::pressed(&store, pressed),
+                // Pressed as it started the app: it starts as if opened, and what
+                // was pressed, from a run before, is for a connection gone.
+                None => app.activate(),
+            }
+        });
+    }
     app.connect_activate(move |app| {
         // Started again while running: GTK hands it to this copy, which shows itself.
         if let Some(store) = shared.borrow().as_ref() {

@@ -20,10 +20,11 @@ use maxnines_desktop_kit::{
     Tokens, notices,
 };
 
+use crate::notify::{self, Pressed};
 use crate::settings::Settings;
 use crate::tray::{IconState, MenuAlert, Tray};
 use crate::window::Ui;
-use crate::{Command, notify, secrets};
+use crate::{Command, secrets};
 
 pub type Shared = Rc<RefCell<Store>>;
 
@@ -49,7 +50,8 @@ pub struct Store {
     /// announced.
     last_alerts: Option<Alerts>,
     /// Counts each sign-in, sign-out and change of server, so an answer for the old
-    /// one is dropped.
+    /// one, or a notification about it, is dropped. It starts from when the app did,
+    /// so a notification from a run before isn't taken for one about this.
     connection: u64,
     /// Counts each time the server is asked, and which answer was used last, so one
     /// overtaken by a later one is dropped.
@@ -119,7 +121,7 @@ pub fn start(app: &adw::Application) -> Shared {
         signing_in: None,
         sign_in_problem: None,
         last_alerts: None,
-        connection: 0,
+        connection: u64::try_from(now_ms()).unwrap_or_default(),
         asks: 0,
         answered: 0,
         commands: commands.clone(),
@@ -147,6 +149,7 @@ pub fn start(app: &adw::Application) -> Shared {
             eprintln!("no tray to show the icon in ({error}), so closing the window quits")
         }
     }
+    notify::learn_how_bodies_are_read();
     let ui = Ui::build(app, &store);
     store.borrow_mut().ui = Some(ui);
 
@@ -187,27 +190,6 @@ fn handle(store: &Shared, command: Command) {
             }
         }
         Command::OpenUrl(url) => open_url(&url),
-        Command::AcknowledgeFromNotice(alert) => {
-            let commands = store.borrow().commands.clone();
-            act(
-                store,
-                move |client| client.acknowledge(alert),
-                move |problem| {
-                    // Acknowledged from a notification, so a notification says if it
-                    // didn't work: the window, where it would otherwise show, may be shut.
-                    notify::post(
-                        &Notice {
-                            id: format!("acknowledge-failed-{alert}"),
-                            title: "Couldn't acknowledge the alert".into(),
-                            body: problem.to_string(),
-                            acknowledges: None,
-                            path: "/alerts".into(),
-                        },
-                        &commands,
-                    );
-                },
-            );
-        }
         Command::SignedInAs(connection, account) => {
             let mut state = store.borrow_mut();
             if state.connection != connection {
@@ -221,6 +203,38 @@ fn handle(store: &Shared, command: Command) {
             let app = store.borrow().app.clone();
             app.quit();
         }
+    }
+}
+
+/// A notification's button, or the notification itself, was pressed. One about a
+/// connection that's since ended shows the window instead, which says what's signed
+/// in now.
+pub fn pressed(store: &Shared, pressed: Pressed) {
+    let current = store.borrow().connection;
+    match pressed {
+        Pressed::Acknowledge { connection, alert } if connection == current => {
+            let app = store.borrow().app.clone();
+            act(
+                store,
+                move |client| client.acknowledge(alert),
+                move |problem| {
+                    // Acknowledged from a notification, so a notification says if it
+                    // didn't work: the window, where it would otherwise show, may be shut.
+                    let notice = Notice {
+                        id: format!("acknowledge-failed-{alert}"),
+                        title: "Couldn't acknowledge the alert".into(),
+                        body: problem.to_string(),
+                        acknowledges: None,
+                        path: "/alerts".into(),
+                    };
+                    notify::post(&app, &notice, current);
+                },
+            );
+        }
+        Pressed::Open { connection, path } if connection == current => {
+            handle(store, Command::Open(path));
+        }
+        _ => show(store),
     }
 }
 
@@ -405,7 +419,7 @@ async fn asked(store: &Shared) {
             state.problem = None;
             if let Some(last) = &state.last_alerts {
                 for notice in notices(last, &answers.alerts, state.settings.notify_when(), now) {
-                    notify::post(&notice, &state.commands);
+                    notify::post(&state.app, &notice, connection);
                 }
             }
             state.last_alerts = Some(answers.alerts);
