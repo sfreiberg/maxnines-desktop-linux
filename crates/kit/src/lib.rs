@@ -15,10 +15,10 @@ pub mod signin;
 pub mod times;
 pub mod tokens;
 
-pub use client::{Client, ServerAddress};
+pub use client::{Client, Listed, ServerAddress};
 pub use error::Error;
 pub use models::{Alerts, MonitoredHost, RemoteCheck, ServerAlert, Severity, Silence, Silences};
-pub use notices::{Notice, NotifyWhen, notices};
+pub use notices::{Notice, Notifier, NotifyWhen};
 pub use overview::Overview;
 pub use signin::Tokens;
 pub use tokens::TokenHolder;

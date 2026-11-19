@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::models::{Alerts, Severity};
+use crate::models::{Alerts, RESOLVED_MARK, Severity};
 use crate::times::age;
 
 /// Which changes someone wants a notification about.
@@ -39,21 +39,41 @@ pub struct Notice {
 /// screen.
 const MOST: usize = 3;
 
-/// The coloured circles the server's Discord messages use, so how bad it is, or that
-/// it's over, shows before a word is read.
-fn mark(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "🔴",
-        Severity::Warning => "🟡",
+/// Works out what's worth a notification each time the server lists its alerts, and
+/// remembers who's been told what.
+#[derive(Debug, Clone, Default)]
+pub struct Notifier {
+    /// The alerts the server listed last time. Nothing until the first answer, so what
+    /// was already firing when the app started isn't news.
+    last: Option<Alerts>,
+    /// The firing alerts the person has been told have started. Told about one, they
+    /// still hear when it ends, even if it's been silenced since, as the server's own
+    /// notifications do.
+    told: HashSet<i64>,
+}
+
+impl Notifier {
+    /// What's worth a notification in `new`, since the last listing.
+    pub fn notices(&mut self, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>) -> Vec<Notice> {
+        let notices = match &self.last {
+            Some(old) => worked_out(old, new, when, now, &mut self.told),
+            None => Vec::new(),
+        };
+        self.last = Some(new.clone());
+        notices
     }
 }
 
-const RESOLVED_MARK: &str = "🟢";
-
-/// What's worth a notification between `old` and `new`. The first time there's no
-/// old, and nothing is: what was already firing when the app started isn't news.
-/// Silenced alerts stay quiet, as they do everywhere else in MaxNines.
-pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>) -> Vec<Notice> {
+/// What's worth a notification between `old` and `new`. Silenced alerts stay quiet,
+/// as they do everywhere else in MaxNines, except for the end of one the person was
+/// already told about. `told` is kept up to date.
+fn worked_out(
+    old: &Alerts,
+    new: &Alerts,
+    when: NotifyWhen,
+    now: DateTime<Utc>,
+    told: &mut HashSet<i64>,
+) -> Vec<Notice> {
     let before: HashMap<i64, _> = old
         .open
         .iter()
@@ -82,6 +102,7 @@ pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>)
             continue;
         }
         worst = worst.max(alert.severity);
+        told.insert(alert.id);
         let level = if was.is_none() || unsilenced {
             match alert.severity {
                 Severity::Critical => "Critical",
@@ -92,7 +113,7 @@ pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>)
         };
         started.push(Notice {
             id: format!("alert-{}-{}", alert.id, alert.severity.as_str()),
-            title: format!("{} {level}: {}", mark(alert.severity), alert.rule_name),
+            title: format!("{} {level}: {}", alert.severity.mark(), alert.rule_name),
             body: alert.summary.clone(),
             acknowledges: (!alert.is_acknowledged()).then_some(alert.id),
             path: alert.page(),
@@ -107,17 +128,16 @@ pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>)
             .rev()
             .map(|alert| (alert.id, alert))
             .collect();
-        for alert in old
-            .open
-            .iter()
-            .filter(|alert| !still.contains(&alert.id) && !alert.is_silenced())
-        {
+        for alert in old.open.iter().filter(|alert| {
+            !still.contains(&alert.id) && (!alert.is_silenced() || told.contains(&alert.id))
+        }) {
             // Only what the server says has resolved: one that's just gone, as when
             // its host was deleted, isn't news worth telling.
             let Some(done) = resolved.get(&alert.id) else {
                 continue;
             };
-            let lasted = age(done.started_at, done.resolved_at.unwrap_or(now));
+            // From when the problem began, as the server's pages say it.
+            let lasted = age(done.breached_at, done.resolved_at.unwrap_or(now));
             // Where things stand now, so it doesn't read as the problem again. One
             // closed for another reason has only what was wrong, said as past.
             let outcome = done
@@ -133,8 +153,10 @@ pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>)
             });
         }
     }
+    // What's ended is no longer anyone's news.
+    told.retain(|id| still.contains(id));
 
-    let started_title = format!("{} {} alerts started", mark(worst), started.len());
+    let started_title = format!("{} {} alerts started", worst.mark(), started.len());
     let ended_title = format!("{RESOLVED_MARK} {} alerts resolved", ended.len());
     let mut all = gathered(started, started_title);
     all.extend(gathered(ended, ended_title));
@@ -188,6 +210,8 @@ pub(crate) mod tests {
             series: None,
             summary: format!("Alert {id}"),
             started_at: now() - TimeDelta::minutes(5),
+            // Its rule waits two minutes before it fires.
+            breached_at: now() - TimeDelta::minutes(7),
             resolved_at: None,
             resolved_summary: None,
             acknowledged_by: None,
@@ -220,6 +244,11 @@ pub(crate) mod tests {
         resolved: true,
     };
 
+    /// What's worth a notification from `old` to `new`, told about nothing before.
+    fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>) -> Vec<Notice> {
+        worked_out(old, new, when, now, &mut HashSet::new())
+    }
+
     fn titles(notices: &[Notice]) -> Vec<&str> {
         notices.iter().map(|notice| notice.title.as_str()).collect()
     }
@@ -245,7 +274,7 @@ pub(crate) mod tests {
         assert_eq!(titles(&all), ["🔴 Critical: Rule 2", "🟡 Warning: Rule 3"]);
         assert_eq!(all[0].body, "Alert 2");
         assert_eq!(all[0].acknowledges, Some(2));
-        assert_eq!(all[0].path, "/hosts/h2");
+        assert_eq!(all[0].path, "/alerts/2");
 
         let critical_only = NotifyWhen {
             critical: true,
@@ -317,16 +346,53 @@ pub(crate) mod tests {
         // The second just went, which the server doesn't call resolved, and the third
         // was silenced.
         assert_eq!(titles(&all), ["🟢 Resolved: Rule 1", "🟢 Resolved: Rule 4"]);
-        // Not what was wrong, which would read as the problem all over again.
-        assert_eq!(all[0].body, "host-1 is back online\nLasted 3m");
+        // Not what was wrong, which would read as the problem all over again. It
+        // lasted from when the problem began, before the alert fired.
+        assert_eq!(all[0].body, "host-1 is back online\nLasted 5m");
         // Closed for another reason, it has only what was wrong, said as past.
-        assert_eq!(all[1].body, "Was: Alert 4\nLasted 1m");
+        assert_eq!(all[1].body, "Was: Alert 4\nLasted 3m");
         assert_eq!(all[0].acknowledges, None);
         let no_resolved = NotifyWhen {
             resolved: false,
             ..EVERYTHING
         };
         assert!(notices(&old, &new, no_resolved, now()).is_empty());
+    }
+
+    #[test]
+    fn someone_told_an_alert_started_hears_it_end_though_its_been_silenced_since() {
+        let mut notifier = Notifier::default();
+        let first = open(vec![alert(2, Severity::Critical).silenced()]);
+        // What was firing when the app started isn't news.
+        assert!(notifier.notices(&first, EVERYTHING, now()).is_empty());
+        let firing = open(vec![
+            alert(1, Severity::Critical),
+            alert(2, Severity::Critical).silenced(),
+        ]);
+        assert_eq!(
+            titles(&notifier.notices(&firing, EVERYTHING, now())),
+            ["🔴 Critical: Rule 1"]
+        );
+        // Silenced from the app after the notification.
+        let silenced = open(vec![
+            alert(1, Severity::Critical).silenced(),
+            alert(2, Severity::Critical).silenced(),
+        ]);
+        assert!(notifier.notices(&silenced, EVERYTHING, now()).is_empty());
+        let over = Alerts {
+            open: vec![],
+            resolved: vec![
+                alert(1, Severity::Critical).resolved(now(), None),
+                alert(2, Severity::Critical).resolved(now(), None),
+            ],
+        };
+        // The second was silenced all along, so nobody was told it started.
+        assert_eq!(
+            titles(&notifier.notices(&over, EVERYTHING, now())),
+            ["🟢 Resolved: Rule 1"]
+        );
+        // Once it's ended, it's forgotten.
+        assert!(notifier.told.is_empty());
     }
 
     #[test]

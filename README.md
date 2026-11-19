@@ -30,14 +30,16 @@ only shows its notifications once the desktop entry is there.
 The icon is MaxNines' green 9, with a red dot and how many alerts are firing when
 something is critical, or an amber square and how many when there are only warnings.
 It turns grey when the server can't be reached, so quiet is never mistaken for fine.
-Its menu lists what's firing, and clicking an alert opens its host in your browser.
+Its menu lists what's firing, and clicking an alert opens its page in MaxNines in your
+browser.
 
 KDE, Cinnamon, XFCE, MATE, Budgie and Ubuntu's GNOME show tray icons as they come. Other
 GNOME desktops, such as Fedora's, need the
 [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
 Without a tray, the app still notifies you, and closing its window quits it.
 With one, closing the window leaves the app in the tray, and frees the memory the
-window used until it's opened again.
+window used until it's opened again. If the panel starts after the app, as it can when
+you sign in, the icon appears once it does.
 
 It draws its window with GTK's cairo renderer, which needs no GPU and much less
 memory than the others. To have it use another, start it with `GSK_RENDERER` set,
@@ -57,6 +59,8 @@ The app stays signed in for up to 90 days after it was last used. It keeps what 
 needs for that in your keyring, through the Secret Service that GNOME Keyring and
 KWallet provide. If the keyring can't be read as it starts, as when it's locked or
 hasn't started yet, the window says so and the app tries again, more slowly each time.
+The same goes for keeping a new sign-in in the keyring: until the app manages it,
+quitting it means signing in again.
 
 To sign it out, choose **Sign out** in its settings. In MaxNines, **Settings**, then
 **Signed-in apps**, lists it as MaxNines Desktop for Linux, with this computer's name,
@@ -84,6 +88,8 @@ The app can tell you when a critical alert starts, when a warning starts, and wh
 alert resolves, each turned on or off in its settings. All three are on to begin with.
 Alerts that a silence or maintenance window is holding back never send one, as
 everywhere else in MaxNines, and one still firing when its silence ends sends one then.
+If you were told an alert started, you're still told when it resolves, even if it was
+silenced in between.
 Nothing that was already firing when the app started is announced, and more than three
 at once arrive as one.
 
@@ -97,7 +103,8 @@ window instead, so they never act on a different sign-in.
 ## Open at login
 
 Turn on **Open at login** in its settings. It then starts in the tray when you sign in,
-without opening its window.
+without opening its window. If no panel shows its icon within a minute, it opens its
+window instead.
 
 ## Building
 

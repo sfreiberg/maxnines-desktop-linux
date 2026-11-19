@@ -3,6 +3,8 @@
 //! firing; the window has the rest.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gtk::cairo;
 use ksni::menu::{MenuItem, StandardItem};
@@ -24,7 +26,7 @@ pub enum IconState {
 }
 
 /// One firing alert, as the menu lists it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuAlert {
     pub label: String,
     pub path: String,
@@ -37,6 +39,9 @@ pub struct Tray {
     /// Whether there's a server to open.
     pub connected: bool,
     pub commands: async_channel::Sender<Command>,
+    /// Whether the desktop's panel is showing the icon: it may start after the app,
+    /// as at login, or restart, and some desktops have none.
+    pub shown: Arc<AtomicBool>,
 }
 
 /// More than this many alerts in the menu is a list nobody reads; the window has
@@ -72,6 +77,20 @@ impl ksni::Tray for Tray {
             description: self.headline.clone(),
             ..Default::default()
         }
+    }
+
+    /// The panel has started showing tray icons, and this one is about to be in it.
+    fn watcher_online(&self) {
+        self.shown.store(true, Ordering::SeqCst);
+        self.send(Command::TrayShown(true));
+    }
+
+    /// The panel isn't showing tray icons, or isn't there yet. The icon carries on,
+    /// and shows when one starts.
+    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+        self.shown.store(false, Ordering::SeqCst);
+        self.send(Command::TrayShown(false));
+        true
     }
 
     /// Clicking the icon, where the desktop passes it on rather than opening the menu.
@@ -359,11 +378,12 @@ mod tests {
             firing: (1..=firing)
                 .map(|n| MenuAlert {
                     label: format!("🔴 disk_{n} is full"),
-                    path: format!("/hosts/h{n}"),
+                    path: format!("/alerts/{n}"),
                 })
                 .collect(),
             connected,
             commands,
+            shown: Arc::new(AtomicBool::new(true)),
         };
         (tray, received)
     }
@@ -414,8 +434,20 @@ mod tests {
             panic!("not an alert")
         };
         (alert.activate)(&mut tray);
-        assert!(matches!(received.try_recv(), Ok(Command::Open(path)) if path == "/hosts/h1"));
+        assert!(matches!(received.try_recv(), Ok(Command::Open(path)) if path == "/alerts/1"));
         tray.activate(0, 0);
         assert!(matches!(received.try_recv(), Ok(Command::Show)));
+    }
+
+    #[test]
+    fn the_app_hears_when_the_panel_starts_and_stops_showing_the_icon() {
+        let (tray, received) = tray(0, true);
+        // It carries on either way, to show once a panel does.
+        assert!(tray.watcher_offline(ksni::OfflineReason::No));
+        assert!(!tray.shown.load(Ordering::SeqCst));
+        assert!(matches!(received.try_recv(), Ok(Command::TrayShown(false))));
+        tray.watcher_online();
+        assert!(tray.shown.load(Ordering::SeqCst));
+        assert!(matches!(received.try_recv(), Ok(Command::TrayShown(true))));
     }
 }

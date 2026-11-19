@@ -5,6 +5,10 @@
 //! newest: the server revokes the whole sign-in if a refresh token it has replaced is
 //! used again a minute later. For the same reason only one refresh runs at a time, and
 //! everything that needs a token meanwhile waits for it.
+//!
+//! If the new refresh token can't be kept, it's still used, as the old one no longer
+//! works, and the holder remembers it isn't kept, so it can be tried again before
+//! the app next starts and reads the old one.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -33,7 +37,8 @@ pub const RETRY_DELAYS: [Duration; 3] = [
 /// each try waited for its answer.
 pub const RETRY_WINDOW: Duration = Duration::from_secs(45);
 
-type Save = Box<dyn Fn(Option<&Tokens>) + Send + Sync>;
+/// Keeps tokens, or forgets them when given nothing, saying why if it couldn't.
+pub type Save = Box<dyn Fn(Option<&Tokens>) -> Result<(), String> + Send + Sync>;
 type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 type Sleep = Box<dyn Fn(Duration) + Send + Sync>;
 
@@ -42,6 +47,8 @@ struct State {
     access: Option<(String, Instant)>,
     /// Set once signing out starts, after which nothing refreshes.
     signing_out: bool,
+    /// The newest tokens, while `save` couldn't keep them.
+    unkept: Option<Tokens>,
 }
 
 pub struct TokenHolder {
@@ -57,13 +64,18 @@ pub struct TokenHolder {
 }
 
 impl TokenHolder {
-    /// Just signed in, with tokens that `save` already has.
-    pub fn signed_in(tokens: &Tokens, endpoints: SignInEndpoints, save: Save) -> Self {
+    /// Just signed in, with tokens that `save` already has, unless it couldn't keep
+    /// them, when `kept` is false and [`Self::keep_again`] tries again.
+    pub fn signed_in(tokens: &Tokens, kept: bool, endpoints: SignInEndpoints, save: Save) -> Self {
         let holder = Self::new(Some(tokens.refresh_token.clone()), endpoints, save);
-        holder.state.lock().unwrap().access = Some((
-            tokens.access_token.clone(),
-            Instant::now() + Duration::from_secs(tokens.expires_in),
-        ));
+        {
+            let mut state = holder.state.lock().unwrap();
+            state.access = Some((
+                tokens.access_token.clone(),
+                Instant::now() + Duration::from_secs(tokens.expires_in),
+            ));
+            state.unkept = (!kept).then(|| tokens.clone());
+        }
         holder
     }
 
@@ -84,6 +96,7 @@ impl TokenHolder {
                 refresh_token,
                 access: None,
                 signing_out: false,
+                unkept: None,
             }),
             refreshing: Mutex::new(()),
         }
@@ -104,13 +117,38 @@ impl TokenHolder {
                 .take()
                 .or_else(|| state.access.take().map(|(token, _)| token));
             state.access = None;
+            state.unkept = None;
             token
         };
-        (self.save)(None);
+        // Forgotten whether or not that works: the server is told next, after which
+        // the token is no use to anyone.
+        let _ = (self.save)(None);
         match token {
             Some(token) => self.endpoints.revoke(&token),
             None => Ok(()),
         }
+    }
+
+    /// Whether the newest refresh token is kept, so the app would start with it.
+    pub fn is_kept(&self) -> bool {
+        self.state.lock().unwrap().unkept.is_none()
+    }
+
+    /// Tries again to keep the newest tokens, after `save` couldn't. Ok once they're
+    /// kept, or if there's nothing left to keep.
+    pub fn keep_again(&self) -> Result<(), String> {
+        // No refresh brings newer ones meanwhile, which this would overwrite.
+        let _only_one = self.refreshing.lock().unwrap();
+        let tokens = {
+            let state = self.state.lock().unwrap();
+            match &state.unkept {
+                Some(tokens) if !state.signing_out => tokens.clone(),
+                _ => return Ok(()),
+            }
+        };
+        (self.save)(Some(&tokens))?;
+        self.state.lock().unwrap().unkept = None;
+        Ok(())
     }
 
     /// The access token, if it isn't about to run out.
@@ -143,15 +181,20 @@ impl TokenHolder {
                 let mut state = self.state.lock().unwrap();
                 state.refresh_token = None;
                 state.access = None;
+                state.unkept = None;
                 drop(state);
-                (self.save)(None);
+                // If it can't be forgotten, the app finds it no longer works next time.
+                let _ = (self.save)(None);
                 return Err(Error::SignedOut);
             }
             Err(error) => return Err(error),
         };
-        // Kept before it's used, so a crash now can't leave the old one saved.
-        (self.save)(Some(&tokens));
+        // Kept before it's used, so a crash now can't leave the old one saved. If it
+        // can't be kept, it's used all the same, as the old one no longer works, and
+        // remembered, so it can be kept later.
+        let kept = (self.save)(Some(&tokens));
         let mut state = self.state.lock().unwrap();
+        state.unkept = kept.is_err().then(|| tokens.clone());
         state.refresh_token = Some(tokens.refresh_token.clone());
         state.access = Some((
             tokens.access_token.clone(),
@@ -230,6 +273,7 @@ mod tests {
             into.lock()
                 .unwrap()
                 .push(tokens.map(|tokens| tokens.refresh_token.clone()));
+            Ok(())
         });
         (saved, save)
     }
@@ -269,11 +313,59 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_token_that_couldnt_be_kept_is_used_and_kept_later() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = count.clone();
+        let fake = Arc::new(Fake::new(move |_| {
+            answer(200, &issued(counted.fetch_add(1, Ordering::SeqCst) + 1))
+        }));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let working = Arc::new(AtomicUsize::new(0));
+        let (into, works) = (saved.clone(), working.clone());
+        let save: Save = Box::new(move |tokens: Option<&Tokens>| {
+            if works.load(Ordering::SeqCst) == 0 {
+                return Err("the keyring went away".into());
+            }
+            into.lock()
+                .unwrap()
+                .push(tokens.map(|tokens| tokens.refresh_token.clone()));
+            Ok(())
+        });
+        let holder = TokenHolder::saved("refresh-0".into(), endpoints(fake.clone()), save);
+        // The old refresh token no longer works, so the new one is used regardless.
+        assert_eq!(holder.access_token().unwrap(), "access-1");
+        assert!(!holder.is_kept());
+        assert_eq!(
+            holder.keep_again(),
+            Err("the keyring went away".to_string())
+        );
+        assert!(!holder.is_kept());
+        working.store(1, Ordering::SeqCst);
+        assert_eq!(holder.keep_again(), Ok(()));
+        assert!(holder.is_kept());
+        assert_eq!(*saved.lock().unwrap(), [Some("refresh-1".to_string())]);
+        // Nothing left to keep.
+        assert_eq!(holder.keep_again(), Ok(()));
+        assert_eq!(saved.lock().unwrap().len(), 1);
+
+        // Not kept at sign-in, it's kept later the same way, unless a refresh that
+        // could be kept has come since.
+        let tokens: Tokens = serde_json::from_str(&issued(9)).unwrap();
+        let (saved, save) = saving();
+        let holder = TokenHolder::signed_in(&tokens, false, endpoints(fake.clone()), save);
+        assert!(!holder.is_kept());
+        holder.access_token_replacing("access-9").unwrap();
+        assert!(holder.is_kept());
+        assert_eq!(holder.keep_again(), Ok(()));
+        assert_eq!(*saved.lock().unwrap(), [Some("refresh-2".to_string())]);
+    }
+
+    #[test]
     fn the_access_token_is_refreshed_a_minute_before_it_runs_out() {
         let fake = Arc::new(Fake::new(|_| answer(200, &issued(2))));
         let (_, save) = saving();
         let tokens: Tokens = serde_json::from_str(&issued(1)).unwrap();
-        let mut holder = TokenHolder::signed_in(&tokens, endpoints(fake.clone()), save);
+        let mut holder = TokenHolder::signed_in(&tokens, true, endpoints(fake.clone()), save);
         let later = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
         let at = later.clone();

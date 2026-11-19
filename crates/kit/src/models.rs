@@ -30,7 +30,19 @@ impl Severity {
             Self::Critical => "critical",
         }
     }
+
+    /// The coloured circle the server's Discord messages use for it, so how bad it is
+    /// shows before a word is read.
+    pub fn mark(self) -> &'static str {
+        match self {
+            Self::Critical => "🔴",
+            Self::Warning => "🟡",
+        }
+    }
 }
+
+/// The circle for something that's over, beside [`Severity::mark`]'s.
+pub const RESOLVED_MARK: &str = "🟢";
 
 /// An alert as the server lists it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -47,7 +59,11 @@ pub struct ServerAlert {
     pub series: Option<String>,
     /// What was wrong, as it said when it fired.
     pub summary: String,
+    /// When it fired.
     pub started_at: DateTime<Utc>,
+    /// When its problem began, which is before it fired by its rule's wait, or more.
+    /// How long it's lasted is measured from this, as the server's pages measure it.
+    pub breached_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
     /// Where things stood as it cleared, such as "web-1 is back online". Missing for
     /// one closed for another reason, such as its rule being deleted, and from older
@@ -83,9 +99,10 @@ impl ServerAlert {
         self.resolved_summary.as_deref().unwrap_or(&self.summary)
     }
 
-    /// The page it opens: its host's.
+    /// The page it opens: the server's own page for it. Every alert has one, unlike
+    /// a host page, which a group of hosts' alert or the server's own doesn't.
     pub fn page(&self) -> String {
-        format!("/hosts/{}", self.host_id)
+        format!("/alerts/{}", self.id)
     }
 }
 
@@ -175,16 +192,19 @@ mod tests {
                  {"id": 7, "rule_id": 1, "rule_name": "High CPU", "severity": "critical",
                   "host_id": "abc", "hostname": "web-1", "series": null, "value": 97.2,
                   "summary": "High CPU on web-1", "started_at": "2026-11-06T04:44:39.545Z",
-                  "resolved_at": null, "resolve_reason": null, "acknowledged_by": null,
+                  "breached_at": "2026-11-06T04:39:39.545Z", "resolved_at": null,
+                  "resolve_reason": null, "acknowledged_by": null,
                   "silence_id": null, "maintenance_window_id": null},
                  {"id": 8, "rule_id": null, "rule_name": "Something new", "severity": "emergency",
                   "host_id": "abc", "hostname": "web-1", "summary": "Something new",
-                  "started_at": "2026-11-06T04:41:40Z", "resolved_at": null, "acknowledged_by": "sam@example.com"}],
+                  "started_at": "2026-11-06T04:41:40Z", "breached_at": "2026-11-06T04:41:40Z",
+                  "resolved_at": null, "acknowledged_by": "sam@example.com"}],
                "resolved": [
                  {"id": 5, "rule_id": 2, "rule_name": "Host offline", "severity": "critical",
                   "host_id": "def", "hostname": "db-1", "series": null,
                   "summary": "db-1 is offline", "started_at": "2026-11-06T03:33:20Z",
-                  "resolved_at": "2026-11-06T04:23:20Z", "resolved_summary": "db-1 is back online",
+                  "breached_at": "2026-11-06T03:31:20Z", "resolved_at": "2026-11-06T04:23:20Z",
+                  "resolved_summary": "db-1 is back online",
                   "acknowledged_by": null, "silence_id": null, "maintenance_window_id": null}]}"#,
         )
         .unwrap();
@@ -198,7 +218,15 @@ mod tests {
         assert!(!alerts.open[1].can_be_silenced());
         assert_eq!(alerts.open[0].says_now(), "High CPU on web-1");
         assert_eq!(alerts.resolved[0].says_now(), "db-1 is back online");
-        assert_eq!(alerts.resolved[0].page(), "/hosts/def");
+        assert_eq!(
+            alerts.open[0].breached_at,
+            "2026-11-06T04:39:39.545Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        // Its own page, whatever it's about: a host, a group of hosts or the server.
+        assert_eq!(alerts.resolved[0].page(), "/alerts/5");
+        let mut fleet = alerts.open[0].clone();
+        fleet.host_id = "fleet".into();
+        assert_eq!(fleet.page(), "/alerts/7");
     }
 
     #[test]

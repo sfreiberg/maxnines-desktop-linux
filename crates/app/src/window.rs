@@ -399,7 +399,10 @@ impl Ui {
         }
         self.alerts.append(&summary);
 
-        if let Some(problem) = &state.action_problem {
+        for problem in [&state.keep_problem, &state.action_problem]
+            .into_iter()
+            .flatten()
+        {
             let label = gtk::Label::builder()
                 .label(problem)
                 .wrap(true)
@@ -467,6 +470,7 @@ pub struct Shown {
     keyring_problem: Option<String>,
     overview: Option<Overview>,
     problem: Option<String>,
+    keep_problem: Option<String>,
     action_problem: Option<String>,
     /// The alerts with an acknowledge or silence running, whose buttons are off.
     busy: BTreeSet<i64>,
@@ -480,6 +484,7 @@ impl Shown {
             keyring_problem: state.keyring_problem.clone(),
             overview: state.overview.clone(),
             problem: state.problem.clone(),
+            keep_problem: state.keep_problem.clone(),
             action_problem: state.action_problem.clone(),
             busy: state.busy.clone(),
         }
@@ -518,8 +523,9 @@ impl Timed {
     fn detail(&self, now: DateTime<Utc>) -> String {
         match self {
             Self::Firing(alert) => {
+                // From when the problem began, as the server's pages say it.
                 let mut detail =
-                    format!("{} · {} ago", alert.rule_name, age(alert.started_at, now));
+                    format!("{} · {} ago", alert.rule_name, age(alert.breached_at, now));
                 if let Some(who) = &alert.acknowledged_by {
                     detail.push_str(&format!(" · acknowledged by {who}"));
                 }
@@ -531,7 +537,7 @@ impl Timed {
             Self::Resolved(alert) => format!(
                 "{} · {} ago",
                 alert.rule_name,
-                age(alert.resolved_at.unwrap_or(alert.started_at), now)
+                age(alert.resolved_at.unwrap_or(alert.breached_at), now)
             ),
             Self::Silence(silence) => {
                 let ends = format!("ends in {}", time_left(silence.ends_at, now));
@@ -617,7 +623,7 @@ fn mark(text: &str, class: &str, name: &str) -> gtk::Label {
     label
 }
 
-/// Clicking the row opens the alert's host in the browser.
+/// Clicking the row opens the alert's page in the browser.
 fn connect_open(row: &adw::ActionRow, alert: &ServerAlert, store: &Shared) {
     let store = store.clone();
     let path = alert.page();
@@ -690,11 +696,13 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "open": [{"id": 7, "rule_id": 1, "rule_name": "High CPU", "severity": "critical",
                       "host_id": "abc", "hostname": "web-1", "summary": "High CPU on web-1",
-                      "started_at": "2026-11-06T04:35:00Z", "resolved_at": null,
+                      "started_at": "2026-11-06T04:35:00Z",
+                      "breached_at": "2026-11-06T04:33:00Z", "resolved_at": null,
                       "acknowledged_by": acknowledged_by}],
             "resolved": [{"id": 5, "rule_id": 2, "rule_name": "Host offline",
                           "severity": "critical", "host_id": "def", "hostname": "db-1",
                           "summary": "db-1 is offline", "started_at": "2026-11-06T04:30:00Z",
+                          "breached_at": "2026-11-06T04:28:00Z",
                           "resolved_at": "2026-11-06T04:40:00Z", "acknowledged_by": null}]
         }))
         .unwrap()
@@ -708,6 +716,7 @@ mod tests {
             keyring_problem: None,
             overview: Some(overview),
             problem: None,
+            keep_problem: None,
             action_problem: None,
             busy: busy.iter().copied().collect(),
         }
@@ -748,7 +757,8 @@ mod tests {
             firing.detail(now()),
             format!(
                 "High CPU · {} ago · acknowledged by sam@example.com",
-                age(now() - TimeDelta::minutes(10), now())
+                // From when the problem began, two minutes before it fired.
+                age(now() - TimeDelta::minutes(12), now())
             )
         );
         let resolved = Timed::Resolved(alerts.resolved[0].clone());

@@ -14,7 +14,7 @@ const MOST_RESOLVED: usize = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overview {
-    /// Firing now, worst first and then newest first.
+    /// Firing now, worst first and then newest problem first.
     pub firing: Vec<ServerAlert>,
     /// What ended in the last hour, newest first.
     pub resolved: Vec<ServerAlert>,
@@ -39,7 +39,7 @@ impl Overview {
             right
                 .severity
                 .cmp(&left.severity)
-                .then(right.started_at.cmp(&left.started_at))
+                .then(right.breached_at.cmp(&left.breached_at))
         });
         let since = now - RECENTLY;
         let mut resolved: Vec<ServerAlert> = alerts
@@ -58,7 +58,11 @@ impl Overview {
                 rules.insert(rule, alert.rule_name.clone());
             }
         }
-        let mut silences = silences.to_vec();
+        // One kept from an earlier answer, while asking again fails, may have ended.
+        let mut silences: Vec<&Silence> = silences
+            .iter()
+            .filter(|silence| silence.ends_at > now)
+            .collect();
         silences.sort_by_key(|silence| silence.ends_at);
         Self {
             firing,
@@ -218,7 +222,7 @@ mod tests {
     #[test]
     fn the_worst_comes_first_and_old_news_goes() {
         let mut older = alert(1, Severity::Critical);
-        older.started_at -= TimeDelta::minutes(1);
+        older.breached_at -= TimeDelta::minutes(1);
         let alerts = Alerts {
             open: vec![
                 older,
@@ -286,6 +290,8 @@ mod tests {
                 silence(4, None, Some("hostname=db*"), None),
                 silence(3, Some(99), None, None),
                 silence(2, Some(1), Some("id=a"), Some("/var")),
+                // Ended since it was listed.
+                silence(-1, None, None, None),
             ],
             now(),
         );

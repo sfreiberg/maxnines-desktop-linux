@@ -34,6 +34,11 @@ pub enum Command {
     /// A refresh brought new tokens, or the sign-in ended: who's signed in now, for
     /// the connection it happened on.
     SignedInAs(u64, Option<(String, String)>),
+    /// The keyring couldn't keep the newest refresh token for the connection, saying
+    /// why.
+    NotKept(u64, String),
+    /// The desktop's panel started or stopped showing the tray icon.
+    TrayShown(bool),
     Quit,
 }
 
@@ -75,8 +80,9 @@ fn main() -> glib::ExitCode {
             return;
         }
         let store = store::start(app);
-        let quietly = background && store.borrow().was_signed_in() && store.borrow().has_tray();
-        if !quietly {
+        if background && store.borrow().was_signed_in() {
+            store::stay_in_tray(&store);
+        } else {
             store::show(&store);
         }
         *shared.borrow_mut() = Some(store);

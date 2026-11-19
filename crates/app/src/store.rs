@@ -14,11 +14,11 @@ use gtk::{gio, glib};
 use ksni::blocking::TrayMethods;
 use maxnines_desktop_kit::client::AccessTokens;
 use maxnines_desktop_kit::http::Ureq;
-use maxnines_desktop_kit::models::{MonitoredHost, RemoteCheck};
 use maxnines_desktop_kit::signin::{self, SignInEndpoints};
+use maxnines_desktop_kit::tokens::Save;
 use maxnines_desktop_kit::{
-    Alerts, Client, Error, Notice, Overview, ServerAddress, ServerAlert, Silences, TokenHolder,
-    Tokens, notices,
+    Client, Error, Listed, Notice, Notifier, Overview, ServerAddress, ServerAlert, Severity,
+    TokenHolder, Tokens,
 };
 
 use crate::notify::{self, Pressed};
@@ -50,10 +50,16 @@ pub struct Store {
     pub sign_in_problem: Option<String>,
     /// Why the keyring couldn't be read at the start, while it's tried again.
     pub keyring_problem: Option<String>,
-    /// The alerts the server listed last time, which notifications are worked out
-    /// against. Nothing until the first answer, so what was already firing isn't
-    /// announced.
-    last_alerts: Option<Alerts>,
+    /// Why the keyring couldn't keep the newest refresh token, while it's tried
+    /// again.
+    pub keep_problem: Option<String>,
+    /// Whether keeping it is being tried again.
+    keeping: bool,
+    /// What's worth a notification, worked out from what the server listed.
+    notifier: Notifier,
+    /// What the server listed last time, whose checks and silences are kept while
+    /// asking for them again fails.
+    listed: Option<Listed>,
     /// Counts each sign-in, sign-out and change of server, so an answer for the old
     /// one, or a notification about it, is dropped. It starts from when the app did,
     /// so a notification from a run before isn't taken for one about this.
@@ -67,12 +73,29 @@ pub struct Store {
     answered: u64,
     commands: async_channel::Sender<Command>,
     tray: Option<ksni::blocking::Handle<Tray>>,
+    /// Whether the desktop's panel is showing the tray icon.
+    tray_shown: Arc<AtomicBool>,
+    /// What the tray icon and its menu were last given, so they're only sent again
+    /// when that changes.
+    tray_drawn: RefCell<Option<TrayView>>,
     /// The window, while it's open.
     pub ui: Option<Ui>,
     app: adw::Application,
-    /// Keeps the app running while its window is closed, when there's a tray to
-    /// bring it back from.
-    _hold: Option<gio::ApplicationHoldGuard>,
+    /// Keeps the app running while its window is closed, once there's a tray icon to
+    /// bring it back from. Kept if the panel goes, as it does while it restarts.
+    hold: Option<gio::ApplicationHoldGuard>,
+    /// Keeps the app running, started at login with its window closed, while it gives
+    /// the panel time to start.
+    waiting_for_tray: Option<gio::ApplicationHoldGuard>,
+}
+
+/// What the tray icon and its menu say.
+#[derive(Debug, Clone, PartialEq)]
+struct TrayView {
+    headline: String,
+    icon: IconState,
+    firing: Vec<MenuAlert>,
+    connected: bool,
 }
 
 impl Store {
@@ -101,20 +124,12 @@ impl Store {
     fn icon_state(&self) -> IconState {
         match (&self.overview, &self.problem) {
             (Some(overview), None) => match overview.worst() {
-                Some(maxnines_desktop_kit::Severity::Critical) => {
-                    IconState::Critical(overview.firing.len())
-                }
-                Some(maxnines_desktop_kit::Severity::Warning) => {
-                    IconState::Warnings(overview.firing.len())
-                }
+                Some(Severity::Critical) => IconState::Critical(overview.firing.len()),
+                Some(Severity::Warning) => IconState::Warnings(overview.firing.len()),
                 None => IconState::Quiet,
             },
             _ => IconState::Unknown,
         }
-    }
-
-    pub fn has_tray(&self) -> bool {
-        self.tray.is_some()
     }
 
     /// Whether it was signed in when it last ran, so has a sign-in to read from the
@@ -143,32 +158,49 @@ pub fn start(app: &adw::Application) -> Shared {
         signing_in: None,
         sign_in_problem: None,
         keyring_problem: None,
-        last_alerts: None,
+        keep_problem: None,
+        keeping: false,
+        notifier: Notifier::default(),
+        listed: None,
         connection,
         current: Arc::new(AtomicU64::new(connection)),
         asks: 0,
         answered: 0,
         commands: commands.clone(),
         tray: None,
+        tray_shown: Arc::new(AtomicBool::new(false)),
+        tray_drawn: RefCell::new(None),
         ui: None,
         app: app.clone(),
-        _hold: None,
+        hold: None,
+        waiting_for_tray: None,
     }));
+    // Shown unless registering it finds no panel to show it in, which says so as it
+    // spawns.
+    let shown = Arc::new(AtomicBool::new(true));
     let tray = Tray {
         headline: "Not set up".into(),
         icons: crate::tray::icons(IconState::Unknown),
         firing: Vec::new(),
         connected: false,
         commands,
+        shown: shown.clone(),
     };
-    match tray.spawn() {
+    // A panel that hasn't started yet, as at login, or one that restarts, is waited
+    // for: the icon shows once it's there.
+    match tray.assume_sni_available(true).spawn() {
         Ok(handle) => {
             let mut state = store.borrow_mut();
             state.tray = Some(handle);
-            state._hold = Some(app.hold());
+            state.tray_shown = shown;
+            if state.tray_shown.load(Ordering::SeqCst) {
+                state.hold = Some(app.hold());
+            } else {
+                eprintln!("no panel is showing tray icons yet, so closing the window quits");
+            }
         }
-        // A GNOME without the AppIndicator extension has nowhere to show it: the app
-        // still works, as a window that quits when it's closed.
+        // Without a session bus there's nowhere to show it: the app still works, as a
+        // window that quits when it's closed.
         Err(error) => {
             eprintln!("no tray to show the icon in ({error}), so closing the window quits")
         }
@@ -188,6 +220,49 @@ pub fn start(app: &adw::Application) -> Shared {
         sign_in_as_saved(&store, server);
     }
     store
+}
+
+/// How long the panel is given to start showing tray icons, started at login, before
+/// the window opens instead, in seconds.
+const TRAY_WAIT: u32 = 60;
+
+/// Started at login, the app waits in the tray rather than opening its window. The
+/// panel may not have started yet, so it's given a while to; if it doesn't, the
+/// window opens, as there'd be no icon to bring the app back from.
+pub fn stay_in_tray(store: &Shared) {
+    let mut state = store.borrow_mut();
+    if state.tray.is_none() {
+        drop(state);
+        show(store);
+        return;
+    }
+    if state.tray_shown.load(Ordering::SeqCst) {
+        return;
+    }
+    let hold = state.app.hold();
+    state.waiting_for_tray = Some(hold);
+    drop(state);
+    let store = store.clone();
+    glib::spawn_future_local(async move {
+        glib::timeout_future_seconds(TRAY_WAIT).await;
+        let shown = store.borrow().tray_shown.load(Ordering::SeqCst);
+        if !shown {
+            show(&store);
+        }
+        // Let go of once the window is open, which keeps the app running.
+        store.borrow_mut().waiting_for_tray = None;
+    });
+}
+
+/// The panel started or stopped showing the tray icon. Once it's shown, the app
+/// keeps running with its window closed, even while the panel restarts.
+fn tray_shown(store: &Shared, shown: bool) {
+    let mut state = store.borrow_mut();
+    if shown && state.hold.is_none() {
+        let hold = state.app.hold();
+        state.hold = Some(hold);
+        state.waiting_for_tray = None;
+    }
 }
 
 /// The first wait before reading the keyring again, and the longest, in seconds.
@@ -284,6 +359,8 @@ fn handle(store: &Shared, command: Command) {
             drop(state);
             render(store);
         }
+        Command::NotKept(connection, error) => not_kept(store, connection, &error),
+        Command::TrayShown(shown) => tray_shown(store, shown),
         Command::Quit => {
             let app = store.borrow().app.clone();
             app.quit();
@@ -363,37 +440,43 @@ pub fn render(store: &Shared) {
         ui.render(&state, store);
     }
     if let Some(tray) = &state.tray {
-        let headline = state.headline();
-        let icons = crate::tray::icons(state.icon_state());
-        let connected = state.client.is_some();
-        let firing: Vec<MenuAlert> = state
-            .overview
-            .as_ref()
-            .map(|overview| {
-                overview
-                    .firing
-                    .iter()
-                    .map(|alert| MenuAlert {
-                        label: format!(
-                            "{} {}",
-                            if alert.severity == maxnines_desktop_kit::Severity::Critical {
-                                "🔴"
-                            } else {
-                                "🟡"
-                            },
-                            alert.summary
-                        ),
-                        path: alert.page(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let view = TrayView {
+            headline: state.headline(),
+            icon: state.icon_state(),
+            firing: state
+                .overview
+                .as_ref()
+                .map(|overview| {
+                    overview
+                        .firing
+                        .iter()
+                        .map(|alert| MenuAlert {
+                            label: format!("{} {}", alert.severity.mark(), alert.summary),
+                            path: alert.page(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            connected: state.client.is_some(),
+        };
+        // This runs several times a check, mostly with nothing new for the tray, and
+        // the icon is drawn and sent over D-Bus at three sizes.
+        let mut drawn = state.tray_drawn.borrow_mut();
+        if drawn.as_ref() == Some(&view) {
+            return;
+        }
+        let icons = (drawn.as_ref().map(|drawn| drawn.icon) != Some(view.icon))
+            .then(|| crate::tray::icons(view.icon));
+        let sent = view.clone();
         tray.update(move |tray| {
-            tray.headline = headline;
-            tray.icons = icons;
-            tray.firing = firing;
-            tray.connected = connected;
+            tray.headline = sent.headline;
+            tray.firing = sent.firing;
+            tray.connected = sent.connected;
+            if let Some(icons) = icons {
+                tray.icons = icons;
+            }
         });
+        *drawn = Some(view);
     }
 }
 
@@ -403,14 +486,15 @@ fn disconnect(state: &mut Store) {
     state.overview = None;
     state.updated = None;
     // Another server's alerts aren't news about this one's.
-    state.last_alerts = None;
+    state.notifier = Notifier::default();
+    state.listed = None;
+    state.keep_problem = None;
+    state.keeping = false;
     state.connection += 1;
     state.current.store(state.connection, Ordering::SeqCst);
     state.client = None;
     state.holder = None;
 }
-
-type Save = Box<dyn Fn(Option<&Tokens>) + Send + Sync>;
 
 /// Starts asking `server`, with tokens from `holder`.
 fn connect(
@@ -425,14 +509,20 @@ fn connect(
     let commands = state.commands.clone();
     // Each refresh token is kept as soon as it comes, and who's signed in kept up to
     // date, unless this sign-in has since ended. This runs on the thread that
-    // refreshed, before the new token is used.
+    // refreshed, before the new token is used. One that can't be kept is tried again
+    // until it is, as the next start would otherwise use the one it replaced.
     let save: Save = Box::new(move |tokens: Option<&Tokens>| {
         let token = tokens.map(|tokens| tokens.refresh_token.as_str());
-        if let Err(error) = secrets::set_refresh_token(token, connection, &current) {
+        let kept = secrets::set_refresh_token(token, connection, &current);
+        if let Err(error) = &kept {
             eprintln!("couldn't update the keyring: {error}");
+            if tokens.is_some() {
+                let _ = commands.send_blocking(Command::NotKept(connection, error.clone()));
+            }
         }
         let account = tokens.map(|tokens| (tokens.user.clone(), tokens.role.clone()));
         let _ = commands.send_blocking(Command::SignedInAs(connection, account));
+        kept
     });
     let http = Arc::new(Ureq::default());
     let holder = Arc::new(holder(
@@ -466,37 +556,16 @@ pub fn refresh(store: &Shared) {
     glib::spawn_future_local(async move { asked(&store).await });
 }
 
-/// Everything the window shows, from one round of asking.
-struct Answers {
-    alerts: Alerts,
-    hosts: Vec<MonitoredHost>,
-    checks: Option<Vec<RemoteCheck>>,
-    silences: Option<Silences>,
-}
-
-fn ask(client: &Client) -> Result<Answers, Error> {
-    let alerts = client.alerts()?;
-    let hosts = client.hosts()?;
-    // Checks and silences are extras: a server too old to list them, or a sign-in not
-    // allowed to, still shows its alerts.
-    Ok(Answers {
-        alerts,
-        hosts,
-        checks: client.remote_checks().ok(),
-        silences: client.silences().ok(),
-    })
-}
-
 async fn asked(store: &Shared) {
-    let (client, connection, ask_number) = {
+    let (client, last, connection, ask_number) = {
         let mut state = store.borrow_mut();
         let Some(client) = state.client.clone() else {
             return;
         };
         state.asks += 1;
-        (client, state.connection, state.asks)
+        (client, state.listed.clone(), state.connection, state.asks)
     };
-    let Ok(result) = gio::spawn_blocking(move || ask(&client)).await else {
+    let Ok(result) = gio::spawn_blocking(move || client.listed(last.as_ref())).await else {
         return;
     };
     let mut state = store.borrow_mut();
@@ -507,26 +576,23 @@ async fn asked(store: &Shared) {
     }
     state.answered = ask_number;
     match result {
-        Ok(answers) => {
+        Ok(listed) => {
             let now = Utc::now();
             state.overview = Some(Overview::new(
-                &answers.alerts,
-                &answers.hosts,
-                answers.checks.as_deref(),
-                &answers
-                    .silences
-                    .map(|silences| silences.active)
-                    .unwrap_or_default(),
+                &listed.alerts,
+                &listed.hosts,
+                listed.checks.as_deref(),
+                listed.silences.as_deref().unwrap_or_default(),
                 now,
             ));
             state.updated = glib::DateTime::now_local().ok();
             state.problem = None;
-            if let Some(last) = &state.last_alerts {
-                for notice in notices(last, &answers.alerts, state.settings.notify_when(), now) {
-                    notify::post(&state.app, &notice, connection);
-                }
+            let when = state.settings.notify_when();
+            let notices = state.notifier.notices(&listed.alerts, when, now);
+            for notice in &notices {
+                notify::post(&state.app, notice, connection);
             }
-            state.last_alerts = Some(answers.alerts);
+            state.listed = Some(listed);
         }
         Err(Error::SignedOut) => signed_out(&mut state),
         Err(error) => state.problem = Some(error.to_string()),
@@ -568,15 +634,30 @@ pub fn sign_in(store: &Shared, typed: &str) {
     glib::spawn_future_local(async move {
         let device = gethostname::gethostname().to_string_lossy().into_owned();
         let endpoints = SignInEndpoints::new(server.clone(), Arc::new(Ureq::default()));
+        // Waiting for the person takes minutes, so it has a thread of its own rather
+        // than one of GIO's few, which the rest of the app shares.
+        let (sender, answer) = async_channel::bounded(1);
         let waiting = cancelled.clone();
-        let result = gio::spawn_blocking(move || {
-            let open = |url: &str| {
-                let _ = commands.send_blocking(Command::OpenUrl(url.to_string()));
-            };
-            signin::through_browser(&endpoints, &device, &open, &waiting, signin::BROWSER_WAIT)
-        })
-        .await
-        .unwrap_or(Err(Error::Cancelled));
+        let asking = endpoints.clone();
+        let spawned = std::thread::Builder::new()
+            .name("sign-in".into())
+            .spawn(move || {
+                let open = |url: &str| {
+                    let _ = commands.send_blocking(Command::OpenUrl(url.to_string()));
+                };
+                let result = signin::through_browser(
+                    &asking,
+                    &device,
+                    &open,
+                    &waiting,
+                    signin::BROWSER_WAIT,
+                );
+                let _ = sender.send_blocking(result);
+            });
+        let result = match spawned {
+            Ok(_) => answer.recv().await.unwrap_or(Err(Error::Cancelled)),
+            Err(error) => Err(Error::SignInFailed(error.to_string())),
+        };
         // Cancelled, or started again since, it has nothing to say.
         let is_ours = |state: &Store| {
             state
@@ -585,6 +666,10 @@ pub fn sign_in(store: &Shared, typed: &str) {
                 .is_some_and(|current| Arc::ptr_eq(current, &cancelled))
         };
         if !is_ours(&store.borrow()) {
+            // Approved in the browser all the same, so the server has it as signed in.
+            if let Ok(tokens) = result {
+                revoke_unused(endpoints, tokens);
+            }
             return;
         }
         let tokens = match result {
@@ -618,30 +703,118 @@ pub fn sign_in(store: &Shared, typed: &str) {
         .unwrap_or_else(|_| Err("keeping it stopped".into()));
         if !is_ours(&store.borrow()) {
             // Cancelled while it was kept, so it's forgotten again, unless a sign-in
-            // since has moved on and kept its own.
+            // since has moved on and kept its own, and signed out on the server.
             let _ =
                 gio::spawn_blocking(move || secrets::set_refresh_token(None, connection, &current))
                     .await;
+            revoke_unused(endpoints, tokens);
             return;
         }
         let mut state = store.borrow_mut();
         state.signing_in = None;
-        state.sign_in_problem = kept.err().map(|error| {
-            format!(
-                "Signed in, but the keyring couldn't keep the sign-in, so it lasts only until \
-                 the app quits ({error})."
-            )
-        });
+        state.sign_in_problem = None;
         state.settings.address = typed;
         set_account(
             &mut state.settings,
             Some((tokens.user.clone(), tokens.role.clone())),
         );
         drop(state);
+        let is_kept = kept.is_ok();
         connect(&store, server, |endpoints, save| {
-            TokenHolder::signed_in(&tokens, endpoints, save)
+            TokenHolder::signed_in(&tokens, is_kept, endpoints, save)
         });
+        if let Err(error) = kept {
+            let connection = store.borrow().connection;
+            not_kept(&store, connection, &error);
+        }
         render(&store);
+    });
+}
+
+/// Signs out on the server a sign-in that was cancelled or replaced after the
+/// browser's approval had already been swapped for tokens, so it isn't left in the
+/// server's list of signed-in apps where the app can't reach it.
+fn revoke_unused(endpoints: SignInEndpoints, tokens: Tokens) {
+    let spawned = std::thread::Builder::new()
+        .name("revoke".into())
+        .spawn(move || {
+            if let Err(error) = endpoints.revoke(&tokens.refresh_token) {
+                eprintln!("couldn't sign out a sign-in that was cancelled: {error}");
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("couldn't sign out a sign-in that was cancelled: {error}");
+    }
+}
+
+/// The first wait before trying again to keep a refresh token the keyring couldn't,
+/// and the longest, in seconds.
+const KEEP_RETRY_FIRST: u32 = 15;
+const KEEP_RETRY_MOST: u32 = 300;
+
+/// What the window says while the newest refresh token isn't kept.
+fn keep_problem(error: &str) -> String {
+    format!(
+        "The keyring couldn't keep the newest sign-in, so if the app stops now it will \
+         have to sign in again. It keeps trying. ({error})"
+    )
+}
+
+/// The keyring couldn't keep the newest refresh token for `connection`: says so, and
+/// tries again, waiting longer each time, until it's kept or the sign-in ends. The
+/// next start would otherwise read the one it replaced, which the server takes for
+/// a copy and answers by revoking the sign-in.
+fn not_kept(store: &Shared, connection: u64, error: &str) {
+    let mut state = store.borrow_mut();
+    if state.connection != connection {
+        return;
+    }
+    state.keep_problem = Some(keep_problem(error));
+    // Already being tried again, or nothing signed in to keep.
+    let holder = if state.keeping {
+        None
+    } else {
+        state.holder.clone()
+    };
+    if holder.is_some() {
+        state.keeping = true;
+    }
+    drop(state);
+    render(store);
+    let Some(holder) = holder else {
+        return;
+    };
+    let store = store.clone();
+    glib::spawn_future_local(async move {
+        let mut wait = KEEP_RETRY_FIRST;
+        loop {
+            glib::timeout_future_seconds(wait).await;
+            if store.borrow().connection != connection {
+                return;
+            }
+            let trying = holder.clone();
+            let kept = gio::spawn_blocking(move || trying.keep_again())
+                .await
+                .unwrap_or_else(|_| Err("keeping it stopped".into()));
+            {
+                let mut state = store.borrow_mut();
+                if state.connection != connection {
+                    return;
+                }
+                match kept {
+                    Ok(()) => {
+                        state.keep_problem = None;
+                        state.keeping = false;
+                    }
+                    Err(error) => state.keep_problem = Some(keep_problem(&error)),
+                }
+            }
+            render(&store);
+            if !store.borrow().keeping {
+                return;
+            }
+            wait = (wait * 2).min(KEEP_RETRY_MOST);
+        }
     });
 }
 

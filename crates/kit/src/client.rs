@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::Error;
 use crate::http::{Answer, Body, Http, Request};
-use crate::models::{Alerts, MonitoredHost, RemoteCheck, ServerAlert, Silences};
+use crate::models::{Alerts, MonitoredHost, RemoteCheck, ServerAlert, Silence, Silences};
 
 /// How long an API request waits for its answer.
 const API_TIMEOUT: Duration = Duration::from_secs(15);
@@ -50,6 +50,18 @@ impl ServerAddress {
     pub fn is_in_the_clear(&self) -> bool {
         self.in_the_clear
     }
+}
+
+/// Everything the app shows, from one round of asking the server.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Listed {
+    pub alerts: Alerts,
+    pub hosts: Vec<MonitoredHost>,
+    /// The server's own checks. None when it can't list them: one too old to, or a
+    /// sign-in not allowed to.
+    pub checks: Option<Vec<RemoteCheck>>,
+    /// The silences running. None when the server can't list them.
+    pub silences: Option<Vec<Silence>>,
 }
 
 /// Something that hands out access tokens: a `TokenHolder` in the app.
@@ -126,6 +138,40 @@ impl Client {
         self.get("remote-checks")
     }
 
+    /// Everything the app shows, asked for all at once, so a slow or unreachable
+    /// server takes as long as one request to answer or give up, not four. Checks and
+    /// silences are extras: when asking for them fails for now, what `last` had is
+    /// kept, so they don't seem to end for a round. A sign-in that's run out ends the
+    /// round, whichever request found out.
+    pub fn listed(&self, last: Option<&Listed>) -> Result<Listed, Error> {
+        let (alerts, hosts, checks, silences) = std::thread::scope(|scope| {
+            let hosts = scope.spawn(|| self.hosts());
+            let checks = scope.spawn(|| self.remote_checks());
+            let silences = scope.spawn(|| self.silences());
+            let alerts = self.alerts();
+            (alerts, joined(hosts), joined(checks), joined(silences))
+        });
+        let signed_out = [
+            alerts.as_ref().err(),
+            hosts.as_ref().err(),
+            checks.as_ref().err(),
+            silences.as_ref().err(),
+        ]
+        .contains(&Some(&Error::SignedOut));
+        if signed_out {
+            return Err(Error::SignedOut);
+        }
+        Ok(Listed {
+            alerts: alerts?,
+            hosts: hosts?,
+            checks: kept(checks, last.and_then(|last| last.checks.clone())),
+            silences: kept(
+                silences.map(|silences| silences.active),
+                last.and_then(|last| last.silences.clone()),
+            ),
+        })
+    }
+
     /// Says whoever signed in is dealing with an alert.
     pub fn acknowledge(&self, alert_id: i64) -> Result<(), Error> {
         self.send(
@@ -141,6 +187,25 @@ impl Client {
         let body = silence_body(alert, for_secs)?;
         self.send("POST", "silences", Body::Json(body.to_string()))
             .map(drop)
+    }
+}
+
+/// What a thread of [`Client::listed`] found. One that panicked panics here too, as it
+/// would have had it run on this thread.
+fn joined<T>(thread: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// What to show of an extra the server was asked for: what it listed; nothing when it
+/// can't list it at all, being too old to or the sign-in not allowed to; or what it
+/// listed last time, when asking failed only for now.
+fn kept<T>(fresh: Result<T, Error>, last: Option<T>) -> Option<T> {
+    match fresh {
+        Ok(listed) => Some(listed),
+        Err(Error::NotAllowed(_) | Error::Status(404) | Error::NotMaxNines) => None,
+        Err(_) => last,
     }
 }
 
@@ -268,6 +333,110 @@ mod tests {
         assert!(error.to_string().contains("responder role"), "{error}");
         let other = Arc::new(Fake::new(|_| answer(200, "<html>")));
         assert_eq!(client(other).alerts(), Err(Error::NotMaxNines));
+    }
+
+    /// Answers each of the four lists by its path, from `answers`.
+    fn lists(answers: [(u16, &'static str); 4]) -> Arc<Fake> {
+        Arc::new(Fake::new(move |request| {
+            let path = request.url.rsplit_once("/api/v1/").unwrap().1;
+            let index = ["alerts", "hosts", "remote-checks", "silences"]
+                .iter()
+                .position(|known| *known == path)
+                .unwrap();
+            let (status, text) = answers[index];
+            answer(status, text)
+        }))
+    }
+
+    const ALERTS: (u16, &str) = (200, r#"{"open": [], "resolved": []}"#);
+    const HOSTS: (u16, &str) = (200, "[]");
+    const CHECKS: (u16, &str) = (200, r#"[{"id": 1, "enabled": true}]"#);
+    const SILENCES: (u16, &str) = (
+        200,
+        r#"{"active": [{"id": 3, "rule_id": null, "ends_at": "2026-11-19T02:30:00Z"}]}"#,
+    );
+
+    #[test]
+    fn everything_is_asked_for_at_once() {
+        use std::sync::Condvar;
+        // Each request waits for all four to have arrived, which only happens if
+        // they're sent together. One at a time, the first gives up waiting.
+        let arrived = Arc::new((Mutex::new(0), Condvar::new()));
+        let fake = Arc::new(Fake::new(move |request| {
+            let (count, all_here) = &*arrived;
+            let mut count = count.lock().unwrap();
+            *count += 1;
+            all_here.notify_all();
+            let (count, waited) = all_here
+                .wait_timeout_while(count, Duration::from_secs(10), |count| *count < 4)
+                .unwrap();
+            drop(count);
+            if waited.timed_out() {
+                return answer(504, "");
+            }
+            let path = request.url.rsplit_once("/api/v1/").unwrap().1;
+            match path {
+                "alerts" => answer(ALERTS.0, ALERTS.1),
+                "hosts" => answer(HOSTS.0, HOSTS.1),
+                "remote-checks" => answer(CHECKS.0, CHECKS.1),
+                _ => answer(SILENCES.0, SILENCES.1),
+            }
+        }));
+        let listed = client(fake).listed(None).unwrap();
+        assert_eq!(listed.checks.unwrap().len(), 1);
+        assert_eq!(listed.silences.unwrap()[0].id, 3);
+    }
+
+    #[test]
+    fn extras_that_cant_be_asked_for_now_are_kept_from_last_time() {
+        let last = client(lists([ALERTS, HOSTS, CHECKS, SILENCES]))
+            .listed(None)
+            .unwrap();
+        // A server that's struggling keeps what it said last time.
+        let struggling = client(lists([ALERTS, HOSTS, (500, ""), (502, "")]))
+            .listed(Some(&last))
+            .unwrap();
+        assert_eq!(struggling, last);
+        // One that can't list them at all, being too old or the sign-in not allowed
+        // to, shows none.
+        let cant = client(lists([
+            ALERTS,
+            HOSTS,
+            (403, r#"{"error": "Not allowed"}"#),
+            (404, ""),
+        ]))
+        .listed(Some(&last))
+        .unwrap();
+        assert_eq!((cant.checks, cant.silences), (None, None));
+        // Without the alerts or hosts there's nothing to show.
+        assert_eq!(
+            client(lists([(500, ""), HOSTS, CHECKS, SILENCES])).listed(Some(&last)),
+            Err(Error::Status(500))
+        );
+    }
+
+    /// Hands out a token, but finds the sign-in has run out when it's turned down.
+    struct RunOut;
+
+    impl AccessTokens for RunOut {
+        fn access_token(&self) -> Result<String, Error> {
+            Ok("token".into())
+        }
+
+        fn access_token_replacing(&self, _: &str) -> Result<String, Error> {
+            Err(Error::SignedOut)
+        }
+    }
+
+    #[test]
+    fn a_sign_in_found_to_have_run_out_ends_the_round() {
+        let fake = lists([(500, ""), HOSTS, CHECKS, (401, "")]);
+        let client = Client::new(
+            ServerAddress::parse("https://monitor.example.com").unwrap(),
+            Arc::new(RunOut),
+            fake,
+        );
+        assert_eq!(client.listed(None), Err(Error::SignedOut));
     }
 
     #[test]

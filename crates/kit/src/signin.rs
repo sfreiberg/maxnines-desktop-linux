@@ -2,10 +2,11 @@
 //! describes: the person approves the app on a MaxNines page, and the browser brings
 //! an approval back to this computer, which the app swaps for tokens.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -239,10 +240,22 @@ impl SignInEndpoints {
     }
 }
 
+/// The most connections read from at once while waiting for the browser. Past this,
+/// the one that's waited longest is dropped, as the least likely to be the browser
+/// coming back, so whatever else connects can't use up the app.
+const MOST_WAITING: usize = 16;
+
+/// How long a connection has to send its request.
+const REQUEST_WAIT: Duration = Duration::from_secs(10);
+
+/// The longest request read: a browser's headers are a few kilobytes.
+const LONGEST_REQUEST: usize = 64 * 1024;
+
 /// Signs in through the browser: listens on 127.0.0.1 for the browser to come back,
 /// has `open` show the person the server's approval page, swaps the approval for
 /// tokens, and only then tells the person in the browser how it went. Gives up after
-/// `wait`, or once `cancelled` is set.
+/// `wait`, or once `cancelled` is set. It all happens on the calling thread, which it
+/// keeps until then.
 pub fn through_browser(
     endpoints: &SignInEndpoints,
     device: &str,
@@ -257,32 +270,51 @@ pub fn through_browser(
     open(&sign_in.authorize_url());
     listener.set_nonblocking(true).map_err(local)?;
     let deadline = Instant::now() + wait;
-    // Each connection is read on its own, so one a browser opens and never uses holds
-    // nothing up; requests come back here to be answered one at a time.
-    let (arrived, requests) = mpsc::channel::<(TcpStream, String)>();
+    // Every connection is read a little at a time, as it sends, so one a browser
+    // opens and never uses holds nothing up.
+    let mut waiting: VecDeque<Waiting> = VecDeque::new();
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let arrived = arrived.clone();
-                std::thread::spawn(move || {
-                    if let Some(target) = read_target(&mut stream) {
-                        let _ = arrived.send((stream, target));
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Not every system has it inherit the listener's.
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
                     }
-                });
+                    if waiting.len() >= MOST_WAITING {
+                        waiting.pop_front();
+                    }
+                    waiting.push_back(Waiting {
+                        stream,
+                        read: Vec::new(),
+                        until: Instant::now() + REQUEST_WAIT,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                // One that gave up before it was taken.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(local(error)),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(local(error)),
         }
-        let Ok((mut stream, target)) = requests.try_recv() else {
+        let Some((mut stream, target)) = next_request(&mut waiting, Instant::now()) else {
             if Instant::now() >= deadline {
                 return Err(Error::TimedOut);
             }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
+        // Answered all at once, rather than as the connection takes it.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_write_timeout(Some(REQUEST_WAIT));
         // Anything else the browser asks for, such as an icon, or an answer to some
         // other request, isn't the one being waited for.
         let Some(callback) = sign_in.callback(&target) else {
@@ -312,23 +344,72 @@ pub fn through_browser(
     }
 }
 
-/// The target of the GET request on `stream`, once its headers have all arrived, as
-/// closing with some unread could cut the page off.
-fn read_target(stream: &mut TcpStream) -> Option<String> {
-    stream.set_nonblocking(false).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok()?;
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 4096];
-    while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 || buffer.len() > 64 * 1024 {
-            return None;
+/// A connection to the loopback port, and what it's sent so far.
+struct Waiting {
+    stream: TcpStream,
+    read: Vec<u8>,
+    /// When it's dropped if it hasn't sent a whole request.
+    until: Instant,
+}
+
+/// How a connection's request is coming along.
+enum Reading {
+    /// Not all here yet.
+    Waiting,
+    /// Here: the target of its GET.
+    Target(String),
+    /// Closed, too slow, too long, or not a GET.
+    Gone,
+}
+
+impl Waiting {
+    /// Reads what's arrived, without waiting for more.
+    fn read(&mut self, now: Instant) -> Reading {
+        let mut chunk = [0u8; 4096];
+        loop {
+            // The headers have all arrived, as closing with some unread could cut the
+            // page off.
+            if self.read.windows(4).any(|window| window == b"\r\n\r\n") {
+                return get_target(&self.read).map_or(Reading::Gone, Reading::Target);
+            }
+            if now >= self.until || self.read.len() > LONGEST_REQUEST {
+                return Reading::Gone;
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return Reading::Gone,
+                Ok(read) => self.read.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Reading::Waiting;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Reading::Gone,
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
-    let text = String::from_utf8_lossy(&buffer);
+}
+
+/// The first connection with its whole request here, taken from `waiting` with the
+/// request's target. Ones that have gone are dropped on the way.
+fn next_request(waiting: &mut VecDeque<Waiting>, now: Instant) -> Option<(TcpStream, String)> {
+    let mut index = 0;
+    while index < waiting.len() {
+        match waiting[index].read(now) {
+            Reading::Waiting => index += 1,
+            Reading::Gone => {
+                waiting.remove(index);
+            }
+            Reading::Target(target) => {
+                let arrived = waiting.remove(index)?;
+                return Some((arrived.stream, target));
+            }
+        }
+    }
+    None
+}
+
+/// The target of a GET request, from its head.
+fn get_target(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
     let mut parts = text.lines().next()?.split(' ');
     match (parts.next(), parts.next()) {
         (Some("GET"), Some(target)) => Some(target.to_string()),
@@ -521,6 +602,63 @@ mod tests {
         assert!(form.contains("grant_type=authorization_code"), "{form}");
         assert!(form.contains("code=the-code"), "{form}");
         assert!(form.contains("code_verifier="), "{form}");
+    }
+
+    #[test]
+    fn connections_that_never_send_dont_keep_the_browser_out() {
+        let fake = Arc::new(Fake::new(|_| {
+            answer(
+                200,
+                r#"{"access_token": "a", "expires_in": 900, "refresh_token": "r",
+                    "role": "responder", "user": "sam@example.com"}"#,
+            )
+        }));
+        let endpoints = SignInEndpoints::new(server(), fake);
+        let browser = |url: &str| {
+            let query = url.split_once('?').unwrap().1;
+            let fields: Vec<(String, String)> = serde_urlencoded::from_str(query).unwrap();
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+            let address = field("redirect_uri")
+                .trim_start_matches("http://")
+                .trim_end_matches("/callback")
+                .to_string();
+            let state = field("state");
+            std::thread::spawn(move || {
+                // Far more than are read at once, open and silent, and one that
+                // starts a request and never finishes it.
+                let idle: Vec<TcpStream> = (0..MOST_WAITING * 3)
+                    .map(|_| TcpStream::connect(&address).unwrap())
+                    .collect();
+                let mut partial = TcpStream::connect(&address).unwrap();
+                write!(partial, "GET /callback?code=x").unwrap();
+                let mut stream = TcpStream::connect(&address).unwrap();
+                write!(
+                    stream,
+                    "GET /callback?code=the-code&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
+                )
+                .unwrap();
+                let mut page = String::new();
+                stream.read_to_string(&mut page).unwrap();
+                assert!(page.contains("Signed in to MaxNines"), "{page}");
+                drop((idle, partial));
+            });
+        };
+        let tokens = through_browser(
+            &endpoints,
+            "laptop",
+            &browser,
+            &AtomicBool::new(false),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(tokens.refresh_token, "r");
     }
 
     #[test]

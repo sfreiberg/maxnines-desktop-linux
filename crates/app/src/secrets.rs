@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use keyring_core::Entry;
+use keyring_core::api::CredentialStoreApi;
 
 const SERVICE: &str = "MaxNines Desktop";
 const ACCOUNT: &str = "refresh-token";
@@ -16,13 +17,13 @@ const ACCOUNT: &str = "refresh-token";
 /// with no other change running.
 static CHANGING: Mutex<()> = Mutex::new(());
 
+/// The entry, through a connection to the Secret Service made for this one use. The
+/// app uses the keyring a few times an hour at most, and a connection kept from
+/// before goes stale when the service restarts, as after a crash or an update, after
+/// which everything through it fails. A new one also finds a service that started
+/// after the app.
 fn entry() -> Result<Entry, keyring_core::Error> {
-    // The store reaches the Secret Service as it's made, so it's made again each time
-    // until that works, rather than once: one that starts after the app is found.
-    if keyring_core::get_default_store().is_none() {
-        keyring_core::set_default_store(zbus_secret_service_keyring_store::Store::new()?);
-    }
-    Entry::new(SERVICE, ACCOUNT)
+    zbus_secret_service_keyring_store::Store::new()?.build(SERVICE, ACCOUNT, None)
 }
 
 /// The saved refresh token, nothing if there isn't one, or why the keyring couldn't
