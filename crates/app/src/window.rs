@@ -1,10 +1,14 @@
 //! The window: what's firing, what resolved lately and the silences running, on one
 //! page, and the settings on another.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use adw::prelude::*;
 use gtk::glib;
+use maxnines_desktop_kit::overview::SilenceRow;
 use maxnines_desktop_kit::times::{age, now_ms, time_left};
-use maxnines_desktop_kit::{ServerAddress, ServerAlert, Severity};
+use maxnines_desktop_kit::{Overview, ServerAddress, ServerAlert, Severity};
 
 use crate::settings::{INTERVALS, Settings, autostart};
 use crate::store::{self, Shared, Store};
@@ -12,8 +16,9 @@ use crate::store::{self, Shared, Store};
 pub struct Ui {
     pub window: adw::ApplicationWindow,
     stack: adw::ViewStack,
-    /// The alerts page's contents, rebuilt each time there's news.
+    /// The alerts page's contents, built again each time there's news.
     alerts: gtk::Box,
+    drawn: RefCell<Option<Drawn>>,
     address: gtk::Entry,
     account: adw::ActionRow,
     sign_in: gtk::Button,
@@ -275,6 +280,7 @@ impl Ui {
             cancel,
             sign_out,
             sign_in_problem,
+            drawn: RefCell::default(),
         }
     }
 
@@ -316,59 +322,61 @@ impl Ui {
         self.sign_in_problem
             .set_visible(state.sign_in_problem.is_some());
 
-        while let Some(child) = self.alerts.first_child() {
-            self.alerts.remove(&child);
+        // The alerts page is built again only when what it shows has changed, so a
+        // check that brings the same news leaves keyboard focus where it was. Times,
+        // such as how long ago an alert started, change in place.
+        let shown = Shown::of(state);
+        let mut drawn = self.drawn.borrow_mut();
+        if drawn.as_ref().is_none_or(|drawn| drawn.shown != shown) {
+            while let Some(child) = self.alerts.first_child() {
+                self.alerts.remove(&child);
+            }
+            *drawn = Some(if signed_in {
+                self.draw_alerts(shown, state, store)
+            } else {
+                self.draw_not_signed_in(shown, state)
+            });
         }
-        if !signed_in {
-            let status = adw::StatusPage::builder()
-                .icon_name("network-server-symbolic")
-                .title(state.headline())
-                .description(glib::markup_escape_text(
-                    state
-                        .keyring_problem
-                        .as_deref()
-                        .unwrap_or("Sign in to your MaxNines server to see its alerts here."),
-                ))
-                .vexpand(true)
-                .build();
-            let open = gtk::Button::builder()
-                .label("Open Settings")
-                .halign(gtk::Align::Center)
-                .css_classes(["pill", "suggested-action"])
-                .build();
-            let stack = self.stack.clone();
-            open.connect_clicked(move |_| stack.set_visible_child_name("settings"));
-            status.set_child(Some(&open));
-            self.alerts.append(&status);
-            return;
+        if let Some(drawn) = drawn.as_ref() {
+            drawn.update(state, now_ms());
         }
-        self.render_alerts(state, store);
     }
 
-    fn render_alerts(&self, state: &Store, store: &Shared) {
-        let now = now_ms();
+    fn draw_not_signed_in(&self, shown: Shown, state: &Store) -> Drawn {
+        let status = adw::StatusPage::builder()
+            .icon_name("network-server-symbolic")
+            .title(state.headline())
+            .description(glib::markup_escape_text(
+                state
+                    .keyring_problem
+                    .as_deref()
+                    .unwrap_or("Sign in to your MaxNines server to see its alerts here."),
+            ))
+            .vexpand(true)
+            .build();
+        let open = gtk::Button::builder()
+            .label("Open Settings")
+            .halign(gtk::Align::Center)
+            .css_classes(["pill", "suggested-action"])
+            .build();
+        let stack = self.stack.clone();
+        open.connect_clicked(move |_| stack.set_visible_child_name("settings"));
+        status.set_child(Some(&open));
+        self.alerts.append(&status);
+        Drawn {
+            shown,
+            headline: None,
+            timed: Vec::new(),
+        }
+    }
+
+    fn draw_alerts(&self, shown: Shown, state: &Store, store: &Shared) -> Drawn {
+        let mut timed = Vec::new();
         let summary = adw::PreferencesGroup::new();
         let headline = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&state.headline()))
             .css_classes(["property"])
             .build();
-        let detail = match (&state.problem, &state.updated) {
-            (Some(problem), _) => {
-                let mut said = problem.clone();
-                if let Some(updated) = &state.updated
-                    && let Ok(time) = updated.format("%H:%M:%S")
-                {
-                    said.push_str(&format!(". Showing what it said at {time}"));
-                }
-                said
-            }
-            (None, Some(updated)) => updated
-                .format("Updated %H:%M:%S")
-                .map(|text| text.to_string())
-                .unwrap_or_default(),
-            (None, None) => "Asking the server".into(),
-        };
-        headline.set_subtitle(&glib::markup_escape_text(&detail));
         summary.add(&headline);
         if let Some(overview) = &state.overview {
             summary.add(&info_row(
@@ -395,54 +403,159 @@ impl Ui {
             self.alerts.append(&label);
         }
 
-        let Some(overview) = &state.overview else {
-            return;
-        };
-        if !overview.firing.is_empty() {
-            let group = adw::PreferencesGroup::builder().title("Firing").build();
-            for alert in &overview.firing {
-                group.add(&firing_row(alert, now, store));
-            }
-            self.alerts.append(&group);
-        }
-        if !overview.resolved.is_empty() {
-            let group = adw::PreferencesGroup::builder()
-                .title("Resolved in the last hour")
-                .build();
-            for alert in &overview.resolved {
-                let row = adw::ActionRow::builder()
-                    .title(glib::markup_escape_text(alert.says_now()))
-                    .subtitle(glib::markup_escape_text(&format!(
-                        "{} · {} ago",
-                        alert.rule_name,
-                        age(alert.resolved_ms.unwrap_or(alert.started_ms), now)
-                    )))
-                    .activatable(true)
-                    .build();
-                row.add_prefix(&mark("✓", "success", "Resolved"));
-                connect_open(&row, alert, store);
-                group.add(&row);
-            }
-            self.alerts.append(&group);
-        }
-        if !overview.silences.is_empty() {
-            let group = adw::PreferencesGroup::builder()
-                .title("Silences running")
-                .build();
-            for silence in &overview.silences {
-                let mut detail = format!("ends in {}", time_left(silence.ends_ms, now));
-                if !silence.reason.is_empty() {
-                    detail = format!("{} · {detail}", silence.reason);
+        if let Some(overview) = &state.overview {
+            if !overview.firing.is_empty() {
+                let group = adw::PreferencesGroup::builder().title("Firing").build();
+                for alert in &overview.firing {
+                    let busy = state.busy.contains(&alert.id);
+                    let row = firing_row(alert, busy, store);
+                    group.add(&row);
+                    timed.push((row, Timed::Firing(alert.clone())));
                 }
-                group.add(
-                    &adw::ActionRow::builder()
-                        .title(glib::markup_escape_text(&silence.covers))
-                        .subtitle(glib::markup_escape_text(&detail))
-                        .build(),
-                );
+                self.alerts.append(&group);
             }
-            self.alerts.append(&group);
+            if !overview.resolved.is_empty() {
+                let group = adw::PreferencesGroup::builder()
+                    .title("Resolved in the last hour")
+                    .build();
+                for alert in &overview.resolved {
+                    let row = adw::ActionRow::builder()
+                        .title(glib::markup_escape_text(alert.says_now()))
+                        .activatable(true)
+                        .build();
+                    row.add_prefix(&mark("✓", "success", "Resolved"));
+                    connect_open(&row, alert, store);
+                    group.add(&row);
+                    timed.push((row, Timed::Resolved(alert.clone())));
+                }
+                self.alerts.append(&group);
+            }
+            if !overview.silences.is_empty() {
+                let group = adw::PreferencesGroup::builder()
+                    .title("Silences running")
+                    .build();
+                for silence in &overview.silences {
+                    let row = adw::ActionRow::builder()
+                        .title(glib::markup_escape_text(&silence.covers))
+                        .build();
+                    group.add(&row);
+                    timed.push((row, Timed::Silence(silence.clone())));
+                }
+                self.alerts.append(&group);
+            }
         }
+        Drawn {
+            shown,
+            headline: Some(headline),
+            timed,
+        }
+    }
+}
+
+/// What the alerts page shows, apart from times, which change in place. It's built
+/// again only when this changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shown {
+    signed_in: bool,
+    headline: String,
+    keyring_problem: Option<String>,
+    overview: Option<Overview>,
+    problem: Option<String>,
+    action_problem: Option<String>,
+    /// The alerts with an acknowledge or silence running, whose buttons are off.
+    busy: BTreeSet<i64>,
+}
+
+impl Shown {
+    fn of(state: &Store) -> Self {
+        Self {
+            signed_in: state.client.is_some(),
+            headline: state.headline(),
+            keyring_problem: state.keyring_problem.clone(),
+            overview: state.overview.clone(),
+            problem: state.problem.clone(),
+            action_problem: state.action_problem.clone(),
+            busy: state.busy.clone(),
+        }
+    }
+}
+
+/// The alerts page as it was last built.
+struct Drawn {
+    shown: Shown,
+    /// The row that says how things are, whose subtitle says when the server last
+    /// answered.
+    headline: Option<adw::ActionRow>,
+    /// Rows that say how long ago something happened, or how long until it ends.
+    timed: Vec<(adw::ActionRow, Timed)>,
+}
+
+enum Timed {
+    Firing(ServerAlert),
+    Resolved(ServerAlert),
+    Silence(SilenceRow),
+}
+
+impl Drawn {
+    /// Brings its times up to date.
+    fn update(&self, state: &Store, now: i64) {
+        if let Some(headline) = &self.headline {
+            headline.set_subtitle(&glib::markup_escape_text(&answered(state)));
+        }
+        for (row, timed) in &self.timed {
+            row.set_subtitle(&glib::markup_escape_text(&timed.detail(now)));
+        }
+    }
+}
+
+impl Timed {
+    fn detail(&self, now: i64) -> String {
+        match self {
+            Self::Firing(alert) => {
+                let mut detail =
+                    format!("{} · {} ago", alert.rule_name, age(alert.started_ms, now));
+                if let Some(who) = &alert.acknowledged_by {
+                    detail.push_str(&format!(" · acknowledged by {who}"));
+                }
+                if alert.is_silenced() {
+                    detail.push_str(" · silenced");
+                }
+                detail
+            }
+            Self::Resolved(alert) => format!(
+                "{} · {} ago",
+                alert.rule_name,
+                age(alert.resolved_ms.unwrap_or(alert.started_ms), now)
+            ),
+            Self::Silence(silence) => {
+                let ends = format!("ends in {}", time_left(silence.ends_ms, now));
+                if silence.reason.is_empty() {
+                    ends
+                } else {
+                    format!("{} · {ends}", silence.reason)
+                }
+            }
+        }
+    }
+}
+
+/// When the server last answered, or why it couldn't be asked.
+fn answered(state: &Store) -> String {
+    match (&state.problem, &state.updated) {
+        (Some(problem), _) => {
+            let mut said = problem.clone();
+            if let Some(updated) = &state.updated
+                && let Ok(time) = updated.format("%H:%M:%S")
+            {
+                said.push_str(&format!(". Showing what it said at {time}"));
+            }
+            said
+        }
+        (None, Some(updated)) => updated
+            .format("Updated %H:%M:%S")
+            .map(|text| text.to_string())
+            .unwrap_or_default(),
+        (None, None) => "Asking the server".into(),
     }
 }
 
@@ -514,17 +627,11 @@ fn connect_open(row: &adw::ActionRow, alert: &ServerAlert, store: &Shared) {
     });
 }
 
-fn firing_row(alert: &ServerAlert, now: i64, store: &Shared) -> adw::ActionRow {
-    let mut detail = format!("{} · {} ago", alert.rule_name, age(alert.started_ms, now));
-    if let Some(who) = &alert.acknowledged_by {
-        detail.push_str(&format!(" · acknowledged by {who}"));
-    }
-    if alert.is_silenced() {
-        detail.push_str(" · silenced");
-    }
+/// A firing alert's row. Its buttons are off while `busy`, as a request for it runs,
+/// so it can't be sent twice.
+fn firing_row(alert: &ServerAlert, busy: bool, store: &Shared) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&alert.summary))
-        .subtitle(glib::markup_escape_text(&detail))
         .activatable(true)
         .build();
     row.add_prefix(&match alert.severity {
@@ -539,6 +646,7 @@ fn firing_row(alert: &ServerAlert, now: i64, store: &Shared) -> adw::ActionRow {
             .label("Acknowledge")
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
+            .sensitive(!busy)
             .build();
         let store = store.clone();
         let alert = alert.clone();
@@ -550,6 +658,7 @@ fn firing_row(alert: &ServerAlert, now: i64, store: &Shared) -> adw::ActionRow {
             .label("Silence 1 hour")
             .valign(gtk::Align::Center)
             .css_classes(["flat"])
+            .sensitive(!busy)
             .build();
         let store = store.clone();
         let alert = alert.clone();
@@ -557,4 +666,82 @@ fn firing_row(alert: &ServerAlert, now: i64, store: &Shared) -> adw::ActionRow {
         row.add_suffix(&button);
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use maxnines_desktop_kit::Alerts;
+
+    use super::*;
+
+    const NOW: i64 = 1_793_940_300_000;
+
+    fn alerts(acknowledged_by: Option<&str>) -> Alerts {
+        serde_json::from_value(serde_json::json!({
+            "open": [{"id": 7, "rule_id": 1, "rule_name": "High CPU", "severity": "critical",
+                      "host_id": "abc", "hostname": "web-1", "summary": "High CPU on web-1",
+                      "started_ms": NOW - 600_000, "resolved_ms": null,
+                      "acknowledged_by": acknowledged_by}],
+            "resolved": [{"id": 5, "rule_id": 2, "rule_name": "Host offline",
+                          "severity": "critical", "host_id": "def", "hostname": "db-1",
+                          "summary": "db-1 is offline", "started_ms": NOW - 900_000,
+                          "resolved_ms": NOW - 300_000, "acknowledged_by": null}]
+        }))
+        .unwrap()
+    }
+
+    fn shown(alerts: &Alerts, now: i64, busy: &[i64]) -> Shown {
+        let overview = Overview::new(alerts, &[], None, &[], now);
+        Shown {
+            signed_in: true,
+            headline: overview.headline(),
+            keyring_problem: None,
+            overview: Some(overview),
+            problem: None,
+            action_problem: None,
+            busy: busy.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn the_same_news_later_isnt_drawn_again() {
+        // Another check, 15 seconds on, with nothing new: only times change, in place.
+        assert_eq!(
+            shown(&alerts(None), NOW, &[]),
+            shown(&alerts(None), NOW + 15_000, &[])
+        );
+    }
+
+    #[test]
+    fn news_or_a_request_starting_or_ending_is_drawn_again() {
+        let before = shown(&alerts(None), NOW, &[]);
+        assert_ne!(before, shown(&alerts(Some("sam@example.com")), NOW, &[]));
+        // Its buttons go off while it's acknowledged or silenced, and on after.
+        assert_ne!(before, shown(&alerts(None), NOW, &[7]));
+        let failed = Shown {
+            action_problem: Some("The server answered with status 500".into()),
+            ..before.clone()
+        };
+        assert_ne!(before, failed);
+        // The resolved alert dropping out of the last hour.
+        assert_ne!(before, shown(&alerts(None), NOW + 3_600_000, &[]));
+    }
+
+    #[test]
+    fn times_say_how_long_ago_or_how_long_left() {
+        let alerts = alerts(Some("sam@example.com"));
+        let firing = Timed::Firing(alerts.open[0].clone());
+        assert_eq!(
+            firing.detail(NOW),
+            format!(
+                "High CPU · {} ago · acknowledged by sam@example.com",
+                age(NOW - 600_000, NOW)
+            )
+        );
+        let resolved = Timed::Resolved(alerts.resolved[0].clone());
+        assert_eq!(
+            resolved.detail(NOW + 60_000),
+            format!("Host offline · {} ago", age(NOW - 300_000, NOW + 60_000))
+        );
+    }
 }

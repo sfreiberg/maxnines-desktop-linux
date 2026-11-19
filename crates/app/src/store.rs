@@ -3,6 +3,7 @@
 //! parts run on other threads and come back here with their answers.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +41,8 @@ pub struct Store {
     pub problem: Option<String>,
     /// Why the last acknowledge or silence didn't work.
     pub action_problem: Option<String>,
+    /// The alerts an acknowledge or silence is running for.
+    pub busy: BTreeSet<i64>,
     /// Set while waiting for the person to sign in in the browser; setting what it
     /// holds cancels that.
     pub signing_in: Option<Arc<AtomicBool>>,
@@ -126,6 +129,7 @@ pub fn start(app: &adw::Application) -> Shared {
         updated: None,
         problem: None,
         action_problem: None,
+        busy: BTreeSet::new(),
         signing_in: None,
         sign_in_problem: None,
         keyring_problem: None,
@@ -289,6 +293,7 @@ pub fn pressed(store: &Shared, pressed: Pressed) {
             let app = store.borrow().app.clone();
             act(
                 store,
+                alert,
                 move |client| client.acknowledge(alert),
                 move |problem| {
                     // Acknowledged from a notification, so a notification says if it
@@ -663,18 +668,25 @@ pub fn sign_out(store: &Shared) {
 
 pub fn acknowledge(store: &Shared, alert: &ServerAlert) {
     let id = alert.id;
-    act(store, move |client| client.acknowledge(id), |_| {});
+    act(store, id, move |client| client.acknowledge(id), |_| {});
 }
 
 pub fn silence_for_an_hour(store: &Shared, alert: &ServerAlert) {
     let alert = alert.clone();
-    act(store, move |client| client.silence(&alert, 3600), |_| {});
+    act(
+        store,
+        alert.id,
+        move |client| client.silence(&alert, 3600),
+        |_| {},
+    );
 }
 
-/// Does something on the server, then asks it again to show the result. `failed` is
-/// told why it didn't work, as well as the window.
+/// Does something to `alert` on the server, then asks it again to show the result.
+/// `failed` is told why it didn't work, as well as the window. Only one runs for an
+/// alert at a time, and its buttons are off meanwhile.
 fn act(
     store: &Shared,
+    alert: i64,
     action: impl FnOnce(&Client) -> Result<(), Error> + Send + 'static,
     failed: impl FnOnce(&str) + 'static,
 ) {
@@ -686,6 +698,11 @@ fn act(
         failed("MaxNines isn't set up");
         return;
     };
+    // Pressed again, or from its notification too, while the first still runs.
+    if !store.borrow_mut().busy.insert(alert) {
+        return;
+    }
+    render(store);
     let store = store.clone();
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || action(&client))
@@ -705,7 +722,10 @@ fn act(
             }
         }
         render(&store);
+        // Its buttons stay off until the server says how it is now.
         asked(&store).await;
+        store.borrow_mut().busy.remove(&alert);
+        render(&store);
     });
 }
 
