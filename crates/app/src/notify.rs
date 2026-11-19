@@ -44,3 +44,14 @@ fn escape(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_body_is_escaped_as_the_notification_service_reads_markup() {
+        assert_eq!(
+            super::escape("Load on <db> & web is > 4"),
+            "Load on &lt;db&gt; &amp; web is &gt; 4"
+        );
+    }
+}

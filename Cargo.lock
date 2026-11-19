@@ -1268,6 +1268,7 @@ dependencies = [
  "notify-rust",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

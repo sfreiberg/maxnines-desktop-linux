@@ -274,3 +274,148 @@ fn badge(context: &cairo::Context, count: usize, (r, g, b): (f64, f64, f64), rou
     );
     let _ = context.show_text(&text);
 }
+
+#[cfg(test)]
+mod tests {
+    use ksni::Tray as _;
+
+    use super::*;
+
+    /// The colour at `(x, y)` of an icon, as red, green, blue and how opaque.
+    fn pixel(icon: &ksni::Icon, x: usize, y: usize) -> (u8, u8, u8, u8) {
+        let at = (y * usize::try_from(icon.width).unwrap() + x) * 4;
+        let [alpha, red, green, blue] = icon.data[at..at + 4] else {
+            unreachable!()
+        };
+        (red, green, blue, alpha)
+    }
+
+    #[test]
+    fn the_icon_comes_at_the_sizes_panels_ask_for() {
+        let icons = icons(IconState::Quiet);
+        let sizes: Vec<(i32, i32)> = icons.iter().map(|icon| (icon.width, icon.height)).collect();
+        assert_eq!(sizes, [(22, 22), (32, 32), (48, 48)]);
+        for icon in &icons {
+            assert_eq!(
+                icon.data.len(),
+                usize::try_from(icon.width * icon.height * 4).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn the_icon_says_the_worst_thing_happening() {
+        let at_48 = |state| icons(state).pop().unwrap();
+        // Cairo may round a channel either way.
+        let near = |(r, g, b, a): (u8, u8, u8, u8), (er, eg, eb): (u8, u8, u8)| {
+            a == 0xff && r.abs_diff(er) <= 2 && g.abs_diff(eg) <= 2 && b.abs_diff(eb) <= 2
+        };
+        let green = (0x6f, 0xdc, 0x8c);
+        // Outside the rounded square, it's see-through.
+        assert_eq!(pixel(&at_48(IconState::Quiet), 0, 0).3, 0);
+        // MaxNines' green on its left edge, or grey when the server can't be asked.
+        assert!(near(pixel(&at_48(IconState::Quiet), 6, 24), green));
+        let (red, gr, blue, _) = pixel(&at_48(IconState::Unknown), 6, 24);
+        assert!(
+            red.abs_diff(gr) < 12 && gr.abs_diff(blue) < 12,
+            "grey, not {red} {gr} {blue}"
+        );
+        // The badge in the lower right, beside its number: red when critical, amber
+        // for warnings only, and none when nothing's firing.
+        let badge = |state| pixel(&at_48(state), 43, 30);
+        assert!(
+            near(badge(IconState::Quiet), green),
+            "{:?}",
+            badge(IconState::Quiet)
+        );
+        assert!(
+            near(badge(IconState::Critical(3)), (224, 28, 36)),
+            "{:?}",
+            badge(IconState::Critical(3))
+        );
+        assert!(
+            near(badge(IconState::Warnings(2)), (245, 158, 10)),
+            "{:?}",
+            badge(IconState::Warnings(2))
+        );
+    }
+
+    fn labels(tray: &Tray) -> Vec<String> {
+        tray.menu()
+            .into_iter()
+            .map(|item| match item {
+                MenuItem::Standard(item) => item.label,
+                MenuItem::Separator => "—".into(),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    fn tray(firing: usize, connected: bool) -> (Tray, async_channel::Receiver<Command>) {
+        let (commands, received) = async_channel::unbounded();
+        let tray = Tray {
+            headline: "2 critical".into(),
+            icons: Vec::new(),
+            firing: (1..=firing)
+                .map(|n| MenuAlert {
+                    label: format!("🔴 disk_{n} is full"),
+                    path: format!("/hosts/h{n}"),
+                })
+                .collect(),
+            connected,
+            commands,
+        };
+        (tray, received)
+    }
+
+    #[test]
+    fn the_menu_lists_whats_firing_and_what_can_be_done() {
+        let (signed_in, _) = tray(2, true);
+        assert_eq!(
+            labels(&signed_in),
+            [
+                "2 critical",
+                "—",
+                // An underscore would otherwise mark a keyboard shortcut.
+                "🔴 disk__1 is full",
+                "🔴 disk__2 is full",
+                "—",
+                "Show MaxNines Desktop",
+                "Open MaxNines in the browser",
+                "Refresh",
+                "—",
+                "Quit",
+            ]
+        );
+        // Not signed in, there's no server to open or ask.
+        let (signed_out, _) = tray(0, false);
+        assert_eq!(
+            labels(&signed_out),
+            ["2 critical", "—", "Show MaxNines Desktop", "—", "Quit"]
+        );
+        // A long list is cut short, with the rest in the window.
+        let (busy, _) = tray(12, true);
+        let labels = labels(&busy);
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.contains("is full"))
+                .count(),
+            10
+        );
+        assert!(labels.contains(&"and 2 more".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn choosing_from_the_menu_tells_the_app() {
+        let (mut tray, received) = tray(1, true);
+        let mut items = tray.menu();
+        let MenuItem::Standard(alert) = items.remove(2) else {
+            panic!("not an alert")
+        };
+        (alert.activate)(&mut tray);
+        assert!(matches!(received.try_recv(), Ok(Command::Open(path)) if path == "/hosts/h1"));
+        tray.activate(0, 0);
+        assert!(matches!(received.try_recv(), Ok(Command::Show)));
+    }
+}

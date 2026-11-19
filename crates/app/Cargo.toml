@@ -19,3 +19,43 @@ maxnines-desktop-kit.workspace = true
 notify-rust = "4.19.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
+# already built, on Rocky Linux 9 so it runs everywhere these need: see
+# packaging/build.sh.
+[package.metadata.deb]
+name = "maxnines-desktop"
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines-desktop-linux/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "A tray app for a MaxNines server's alerts: a tray icon that says the worst thing firing,\nnotifications as alerts start and resolve, and a window with the rest."
+section = "net"
+priority = "optional"
+depends = "libc6 (>= 2.34), libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.1)"
+assets = [
+  ["target/release/maxnines-desktop", "usr/bin/", "755"],
+  ["../../packaging/com.maxnines.Desktop.desktop", "usr/share/applications/", "644"],
+  ["../../packaging/com.maxnines.Desktop.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["../../README.md", "usr/share/doc/maxnines-desktop/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "maxnines-desktop"
+summary = "MaxNines Desktop: a MaxNines server's alerts in the tray"
+description = "A tray app for a MaxNines server's alerts: a tray icon that says the worst thing firing,\nnotifications as alerts start and resolve, and a window with the rest."
+assets = [
+  { source = "target/release/maxnines-desktop", dest = "/usr/bin/maxnines-desktop", mode = "755" },
+  { source = "../../packaging/com.maxnines.Desktop.desktop", dest = "/usr/share/applications/com.maxnines.Desktop.desktop", mode = "644" },
+  { source = "../../packaging/com.maxnines.Desktop.svg", dest = "/usr/share/icons/hicolor/scalable/apps/com.maxnines.Desktop.svg", mode = "644" },
+  { source = "../../README.md", dest = "/usr/share/doc/maxnines-desktop/README.md", mode = "644", doc = true },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-desktop/LICENSE", mode = "644", doc = true },
+]
+auto-req = "no"
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.34"
+gtk4 = ">= 4.6"
+libadwaita = ">= 1.1"

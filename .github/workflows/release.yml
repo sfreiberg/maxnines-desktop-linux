@@ -1,0 +1,129 @@
+# Builds the Linux packages, installs each on the systems it's for, and publishes a
+# GitHub release when a version tag such as v0.1.0 is pushed. A tag with a suffix,
+# such as v0.1.0-alpha.1, makes a pre-release. The tag has to match the version in
+# Cargo.toml.
+#
+# A pull request that changes the packaging runs everything but publishing, so it's
+# known to work before a tag needs it. So does starting it by hand from Actions.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - packaging/**
+      - Cargo.toml
+      - crates/app/Cargo.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  check:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml, $version"
+            exit 1
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  packages:
+    name: Packages for ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build on Rocky Linux 9
+        run: docker run --rm -v "$PWD:/work" -w /work rockylinux:9 sh packaging/build.sh
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Make the .deb, .rpm and .tar.gz
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p packages
+          cargo deb -p maxnines-desktop --no-build --no-strip -o packages/
+          # RPM versions can't contain "-". A "~" sorts a pre-release before the
+          # release, as cargo deb does for Debian.
+          cargo generate-rpm -p crates/app -s "version = \"$(echo "$VERSION" | tr - '~')\"" -o packages/
+          folder="maxnines-desktop-$VERSION"
+          mkdir -p "tarball/$folder"
+          cp target/release/maxnines-desktop packaging/com.maxnines.Desktop.desktop \
+            packaging/com.maxnines.Desktop.svg README.md LICENSE "tarball/$folder/"
+          tar -czf "packages/maxnines-desktop-$VERSION-$ARCH-linux.tar.gz" -C tarball "$folder"
+          ls -l packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/
+
+  # Installs each package on the oldest of every system it's for, and the newest,
+  # and runs what it installed.
+  test-packages:
+    name: Install on ${{ matrix.image }} ${{ matrix.arch }}
+    needs: [check, packages]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "debian:13", "rockylinux:9", "fedora:latest"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages
+      - run: >
+          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}"
+          sh packaging/test-install.sh "${{ needs.check.outputs.version }}"
+
+  publish:
+    name: Publish the release
+    if: github.ref_type == 'tag'
+    needs: [check, test-packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: release
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release && sha256sum * > SHA256SUMS)
+          flags=
+          if [ "${{ needs.check.outputs.prerelease }}" = true ]; then
+            flags=--prerelease
+          fi
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "MaxNines Desktop for Linux $GITHUB_REF_NAME" --generate-notes $flags

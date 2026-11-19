@@ -8,6 +8,22 @@ Windows, and does the same things.
 It needs GTK 4.6 and libadwaita 1.1 or later: Ubuntu 22.04, Debian 12, Fedora 36 and
 anything newer.
 
+## Installing
+
+Download the package for your system from
+[Releases](https://github.com/sfreiberg/maxnines-desktop-linux/releases): `x86_64` or
+`amd64` for most PCs, `aarch64` or `arm64` for Arm ones.
+
+```sh
+sudo apt install ./maxnines-desktop_*.deb     # Debian, Ubuntu, Mint, Pop!_OS
+sudo dnf install ./maxnines-desktop-*.rpm     # Fedora, RHEL, Rocky, Alma
+```
+
+Either one installs what it needs, and adds MaxNines Desktop to your applications.
+For anything else, the `.tar.gz` has the program, its desktop entry and icon: put
+`maxnines-desktop` on your `PATH`, and the other two in
+`~/.local/share/applications` and `~/.local/share/icons/hicolor/scalable/apps`.
+
 ## The tray icon
 
 The icon is MaxNines' green 9, with a red dot and how many alerts are firing when

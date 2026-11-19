@@ -40,6 +40,11 @@ pub enum Command {
 }
 
 fn main() -> glib::ExitCode {
+    // Says what it is without starting, as the package tests use to check it runs.
+    if std::env::args().any(|argument| argument == "--version") {
+        println!("maxnines-desktop {}", env!("CARGO_PKG_VERSION"));
+        return glib::ExitCode::SUCCESS;
+    }
     // Started at sign-in, it waits in the tray rather than opening its window.
     let background = std::env::args().any(|argument| argument == "--background");
     let app = adw::Application::builder().application_id(APP_ID).build();
