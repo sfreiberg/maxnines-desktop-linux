@@ -58,8 +58,9 @@ trust store. On Debian and Ubuntu, copy it as a `.crt` file to
 `/usr/local/share/ca-certificates` and run `sudo update-ca-certificates`. On Fedora
 and RHEL, copy it to `/etc/pki/ca-trust/source/anchors` and run `sudo update-ca-trust`.
 
-A server reached over plain `http` should be on your local network, as the sign-in
-would otherwise cross the internet unencrypted.
+Over plain `http`, the sign-in crosses the network unencrypted, so only use it for a
+server on a network you trust. Settings warns you under the address when it's plain
+`http` to anywhere but this computer.
 
 ## What it shows
 

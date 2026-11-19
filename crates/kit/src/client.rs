@@ -216,11 +216,18 @@ mod tests {
                 .unwrap()
                 .is_in_the_clear()
         );
-        assert!(
-            !ServerAddress::parse("http://localhost:9000")
-                .unwrap()
-                .is_in_the_clear()
-        );
+        // This computer, however it's written, is never in the clear.
+        for here in [
+            "http://localhost:9000",
+            "HTTP://LOCALHOST:9000",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            assert!(
+                !ServerAddress::parse(here).unwrap().is_in_the_clear(),
+                "{here}"
+            );
+        }
         for bad in [
             "",
             "monitor.example.com",

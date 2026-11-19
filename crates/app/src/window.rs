@@ -4,7 +4,7 @@
 use adw::prelude::*;
 use gtk::glib;
 use maxnines_desktop_kit::times::{age, now_ms, time_left};
-use maxnines_desktop_kit::{ServerAlert, Severity};
+use maxnines_desktop_kit::{ServerAddress, ServerAlert, Severity};
 
 use crate::settings::{INTERVALS, Settings, autostart};
 use crate::store::{self, Shared, Store};
@@ -50,10 +50,7 @@ impl Ui {
         // The server, and who's signed in to it.
         let server = adw::PreferencesGroup::builder()
             .title("Server")
-            .description(
-                "The address you open MaxNines at. Plain http only works on your local \
-                 network, where the sign-in doesn't cross the internet unencrypted.",
-            )
+            .description("The address you open MaxNines at.")
             .build();
         let address = gtk::Entry::builder()
             .text(&state.settings.address)
@@ -82,6 +79,20 @@ impl Ui {
         account.add_suffix(&cancel);
         account.add_suffix(&sign_out);
         server.add(&account);
+        // Worded as the Mac app words it. Shown for the address typed while signing
+        // in, and the one signed in to after.
+        let in_the_clear = gtk::Label::builder()
+            .label(
+                "Over plain http the sign in crosses the network unencrypted, so only use \
+                 it on a network you trust.",
+            )
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["warning"])
+            .margin_top(6)
+            .visible(is_in_the_clear(&state.settings.address))
+            .build();
+        server.add(&in_the_clear);
         let sign_in_problem = gtk::Label::builder()
             .wrap(true)
             .xalign(0.0)
@@ -212,6 +223,11 @@ impl Ui {
                 }
             });
         }
+        // Nothing but the warning listens, so this is safe while the store is
+        // borrowed, as it is when a render sets the address.
+        address.connect_changed(move |entry| {
+            in_the_clear.set_visible(is_in_the_clear(&entry.text()));
+        });
         {
             let store = store.clone();
             cancel.connect_clicked(move |_| store::cancel_sign_in(&store));
@@ -427,6 +443,12 @@ impl Ui {
             self.alerts.append(&group);
         }
     }
+}
+
+/// Whether `typed` is a server the sign-in would reach unencrypted, over plain http to
+/// somewhere other than this computer.
+fn is_in_the_clear(typed: &str) -> bool {
+    ServerAddress::parse(typed).is_ok_and(|server| server.is_in_the_clear())
 }
 
 /// Saves which notifications are wanted as a switch is flipped.
