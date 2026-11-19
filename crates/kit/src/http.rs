@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use ureq::tls::{RootCerts, TlsConfig};
+
 use crate::Error;
 
 /// A request, as the client builds it.
@@ -44,7 +46,9 @@ pub trait Http: Send + Sync {
     fn send(&self, request: &Request) -> Result<Answer, Error>;
 }
 
-/// Sends through ureq, trusting the certificates rustls bundles.
+/// Sends through ureq, trusting the certificates the system does: the ones in its
+/// trust store, such as `/etc/ssl/certs`, which a company's own certificate authority
+/// is added to, as the Mac and Windows apps do.
 pub struct Ureq {
     agent: ureq::Agent,
 }
@@ -53,6 +57,11 @@ impl Default for Ureq {
     fn default() -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .tls_config(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
             .user_agent(concat!(
                 "maxnines-desktop-linux/",
                 env!("CARGO_PKG_VERSION")
@@ -160,5 +169,21 @@ pub mod fake {
             status,
             text: text.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ureq::tls::RootCerts;
+
+    use super::Ureq;
+
+    #[test]
+    fn certificates_are_checked_against_the_systems_trust_store() {
+        let ureq = Ureq::default();
+        assert!(matches!(
+            ureq.agent.config().tls_config().root_certs(),
+            RootCerts::PlatformVerifier
+        ));
     }
 }

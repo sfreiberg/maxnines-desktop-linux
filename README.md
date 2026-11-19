@@ -52,6 +52,12 @@ KWallet provide. To sign it out, choose **Sign out** in its settings. In MaxNine
 **Settings**, then **Signed-in apps**, lists it as MaxNines Desktop for Linux, with
 this computer's name, and you can revoke it there too.
 
+It trusts the certificates your system trusts. A server whose certificate comes from
+your company's own certificate authority works once that authority is in the system's
+trust store. On Debian and Ubuntu, copy it as a `.crt` file to
+`/usr/local/share/ca-certificates` and run `sudo update-ca-certificates`. On Fedora
+and RHEL, copy it to `/etc/pki/ca-trust/source/anchors` and run `sudo update-ca-trust`.
+
 A server reached over plain `http` should be on your local network, as the sign-in
 would otherwise cross the internet unencrypted.
 
