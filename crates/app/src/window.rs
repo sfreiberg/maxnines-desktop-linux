@@ -322,12 +322,13 @@ impl Ui {
         if !signed_in {
             let status = adw::StatusPage::builder()
                 .icon_name("network-server-symbolic")
-                .title(if state.was_signed_out() {
-                    "Signed out"
-                } else {
-                    "Not set up"
-                })
-                .description("Sign in to your MaxNines server to see its alerts here.")
+                .title(state.headline())
+                .description(glib::markup_escape_text(
+                    state
+                        .keyring_problem
+                        .as_deref()
+                        .unwrap_or("Sign in to your MaxNines server to see its alerts here."),
+                ))
                 .vexpand(true)
                 .build();
             let open = gtk::Button::builder()

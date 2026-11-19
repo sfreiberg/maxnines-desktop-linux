@@ -49,9 +49,12 @@ Without a tray, the app still notifies you, and closing its window quits it.
 
 The app stays signed in for up to 90 days after it was last used. It keeps what it
 needs for that in your keyring, through the Secret Service that GNOME Keyring and
-KWallet provide. To sign it out, choose **Sign out** in its settings. In MaxNines,
-**Settings**, then **Signed-in apps**, lists it as MaxNines Desktop for Linux, with
-this computer's name, and you can revoke it there too.
+KWallet provide. If the keyring can't be read as it starts, as when it's locked or
+hasn't started yet, the window says so and the app tries again, more slowly each time.
+
+To sign it out, choose **Sign out** in its settings. In MaxNines, **Settings**, then
+**Signed-in apps**, lists it as MaxNines Desktop for Linux, with this computer's name,
+and you can revoke it there too.
 
 It trusts the certificates your system trusts. A server whose certificate comes from
 your company's own certificate authority works once that authority is in the system's
