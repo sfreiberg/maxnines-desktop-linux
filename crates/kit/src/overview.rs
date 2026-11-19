@@ -168,20 +168,20 @@ impl SilenceRow {
                     .unwrap_or_else(|| "One alert rule".to_string()),
             );
         }
-        if !silence.series.is_empty() {
-            what.push(silence.series.clone());
+        if let Some(series) = &silence.series {
+            what.push(series.clone());
         }
-        let filter = silence.filter.trim();
+        let filter = silence.filter.as_deref();
         let host = filter
-            .strip_prefix("id=")
+            .and_then(|filter| filter.strip_prefix("id="))
             .and_then(|id| hosts.iter().find(|host| host.id == id));
-        let place = if filter.is_empty() {
-            "every host".to_string()
-        } else {
-            host.map_or_else(|| filter.to_string(), |host| host.hostname.clone())
+        let place = match (filter, host) {
+            (None, _) => "every host".to_string(),
+            (Some(_), Some(host)) => host.hostname.clone(),
+            (Some(filter), None) => filter.to_string(),
         };
         let covers = if what.is_empty() {
-            if filter.is_empty() {
+            if filter.is_none() {
                 "Every alert".to_string()
             } else {
                 format!("Everything on {place}")
@@ -208,10 +208,9 @@ mod tests {
         MonitoredHost {
             id: id.into(),
             hostname: format!("host-{id}"),
-            public_key: "k".into(),
             state: "approved".into(),
             online,
-            kind: Some("agent".into()),
+            kind: "agent".into(),
             health: None,
         }
     }
@@ -266,11 +265,11 @@ mod tests {
 
     #[test]
     fn silences_say_what_they_keep_quiet() {
-        let silence = |id, rule_id, filter: &str, series: &str| Silence {
+        let silence = |id, rule_id, filter: Option<&str>, series: Option<&str>| Silence {
             id,
             rule_id,
-            filter: filter.into(),
-            series: series.into(),
+            filter: filter.map(Into::into),
+            series: series.map(Into::into),
             reason: "deploy".into(),
             ends_at: now() + TimeDelta::seconds(id),
         };
@@ -283,10 +282,10 @@ mod tests {
             &[host("a", true)],
             None,
             &[
-                silence(5, None, "", ""),
-                silence(4, None, "hostname=db*", ""),
-                silence(3, Some(99), "", ""),
-                silence(2, Some(1), "id=a", "/var"),
+                silence(5, None, None, None),
+                silence(4, None, Some("hostname=db*"), None),
+                silence(3, Some(99), None, None),
+                silence(2, Some(1), Some("id=a"), Some("/var")),
             ],
             now(),
         );

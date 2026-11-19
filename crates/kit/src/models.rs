@@ -41,10 +41,10 @@ pub struct ServerAlert {
     pub severity: Severity,
     pub host_id: String,
     pub hostname: String,
-    /// Which of its rule's series it's about, such as a check's name. Empty for alerts
-    /// about the host as a whole, and missing from older servers.
+    /// Which of its rule's series it's about, such as a check's name. None for alerts
+    /// about the host as a whole.
     #[serde(default)]
-    pub series: String,
+    pub series: Option<String>,
     /// What was wrong, as it said when it fired.
     pub summary: String,
     pub started_at: DateTime<Utc>,
@@ -105,12 +105,12 @@ pub struct Silence {
     pub id: i64,
     /// The alert rule it covers, or every rule.
     pub rule_id: Option<i64>,
-    /// Which hosts it covers, such as `id=7f3c…` or `hostname=db*`. Empty for all.
+    /// Which hosts it covers, such as `id=7f3c…` or `hostname=db*`. None for all.
     #[serde(default)]
-    pub filter: String,
-    /// One series alone, such as a check's name. Empty for all.
+    pub filter: Option<String>,
+    /// One series alone, such as a check's name. None for all.
     #[serde(default)]
-    pub series: String,
+    pub series: Option<String>,
     #[serde(default)]
     pub reason: String,
     pub ends_at: DateTime<Utc>,
@@ -144,14 +144,10 @@ pub struct Latest {
 pub struct MonitoredHost {
     pub id: String,
     pub hostname: String,
-    #[serde(default)]
-    pub public_key: String,
     pub state: String,
     pub online: bool,
-    /// `agent`, `agentless` or `built_in`. A server from before hosts could go without
-    /// an agent doesn't say.
-    #[serde(default)]
-    pub kind: Option<String>,
+    /// `agent`, `agentless` or `built_in`.
+    pub kind: String,
     /// How it is, such as `online`, `offline` or `not_read`.
     #[serde(default)]
     pub health: Option<String>,
@@ -162,14 +158,9 @@ impl MonitoredHost {
     /// built-in hosts, and not one with no agent that nothing is read for, which is
     /// neither online nor offline.
     pub fn is_counted(&self) -> bool {
-        if self.state != "approved" || self.health.as_deref() == Some("not_read") {
-            return false;
-        }
-        // Without a kind, only a built-in host has no key.
-        match &self.kind {
-            Some(kind) => kind != "built_in",
-            None => !self.public_key.is_empty(),
-        }
+        self.state == "approved"
+            && self.health.as_deref() != Some("not_read")
+            && self.kind != "built_in"
     }
 }
 
@@ -182,7 +173,7 @@ mod tests {
         let alerts: Alerts = serde_json::from_str(
             r#"{"open": [
                  {"id": 7, "rule_id": 1, "rule_name": "High CPU", "severity": "critical",
-                  "host_id": "abc", "hostname": "web-1", "series": "", "value": 97.2,
+                  "host_id": "abc", "hostname": "web-1", "series": null, "value": 97.2,
                   "summary": "High CPU on web-1", "started_at": "2026-11-06T04:44:39.545Z",
                   "resolved_at": null, "resolve_reason": null, "acknowledged_by": null,
                   "silence_id": null, "maintenance_window_id": null},
@@ -191,13 +182,15 @@ mod tests {
                   "started_at": "2026-11-06T04:41:40Z", "resolved_at": null, "acknowledged_by": "sam@example.com"}],
                "resolved": [
                  {"id": 5, "rule_id": 2, "rule_name": "Host offline", "severity": "critical",
-                  "host_id": "def", "hostname": "db-1", "series": "",
+                  "host_id": "def", "hostname": "db-1", "series": null,
                   "summary": "db-1 is offline", "started_at": "2026-11-06T03:33:20Z",
                   "resolved_at": "2026-11-06T04:23:20Z", "resolved_summary": "db-1 is back online",
                   "acknowledged_by": null, "silence_id": null, "maintenance_window_id": null}]}"#,
         )
         .unwrap();
         assert_eq!(alerts.open[0].severity, Severity::Critical);
+        // An alert about the host as a whole has no series.
+        assert_eq!(alerts.open[0].series, None);
         // A severity the app doesn't know is at least a warning, and fields older
         // servers leave out are empty.
         assert_eq!(alerts.open[1].severity, Severity::Warning);
@@ -232,23 +225,18 @@ mod tests {
 
     #[test]
     fn only_hosts_that_could_be_online_are_counted() {
-        let host =
-            |state: &str, kind: Option<&str>, health: Option<&str>, key: &str| MonitoredHost {
-                id: "a".into(),
-                hostname: "a".into(),
-                public_key: key.into(),
-                state: state.into(),
-                online: true,
-                kind: kind.map(Into::into),
-                health: health.map(Into::into),
-            };
-        assert!(host("approved", Some("agent"), Some("online"), "k").is_counted());
-        assert!(!host("pending", Some("agent"), None, "k").is_counted());
-        assert!(!host("approved", Some("built_in"), None, "").is_counted());
-        assert!(!host("approved", Some("agentless"), Some("not_read"), "").is_counted());
-        assert!(host("approved", Some("agentless"), Some("online"), "").is_counted());
-        // An older server, which doesn't say what kind.
-        assert!(host("approved", None, None, "k").is_counted());
-        assert!(!host("approved", None, None, "").is_counted());
+        let host = |state: &str, kind: &str, health: Option<&str>| MonitoredHost {
+            id: "a".into(),
+            hostname: "a".into(),
+            state: state.into(),
+            online: true,
+            kind: kind.into(),
+            health: health.map(Into::into),
+        };
+        assert!(host("approved", "agent", Some("online")).is_counted());
+        assert!(!host("pending", "agent", None).is_counted());
+        assert!(!host("approved", "built_in", None).is_counted());
+        assert!(!host("approved", "agentless", Some("not_read")).is_counted());
+        assert!(host("approved", "agentless", Some("online")).is_counted());
     }
 }

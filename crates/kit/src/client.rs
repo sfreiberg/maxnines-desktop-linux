@@ -164,8 +164,8 @@ fn silence_body(alert: &ServerAlert, for_secs: u64) -> Result<Value, Error> {
     if alert.host_id != "fleet" {
         body["filter"] = json!(format!("id={}", alert.host_id));
     }
-    if !alert.series.is_empty() {
-        body["series"] = json!(alert.series);
+    if let Some(series) = &alert.series {
+        body["series"] = json!(series);
     }
     Ok(body)
 }
@@ -274,7 +274,7 @@ mod tests {
     fn a_silence_covers_the_one_alert() {
         let fake = Arc::new(Fake::new(|_| answer(201, "{}")));
         let mut checked = alert(7, Severity::Critical);
-        checked.series = "https://example.com".into();
+        checked.series = Some("https://example.com".into());
         client(fake.clone()).silence(&checked, 3600).unwrap();
         let sent = &fake.sent()[0];
         assert_eq!(sent.url, "https://monitor.example.com/api/v1/silences");

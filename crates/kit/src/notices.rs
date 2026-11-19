@@ -185,7 +185,7 @@ pub(crate) mod tests {
             severity,
             host_id: format!("h{id}"),
             hostname: format!("host-{id}"),
-            series: String::new(),
+            series: None,
             summary: format!("Alert {id}"),
             started_at: now() - TimeDelta::minutes(5),
             resolved_at: None,
