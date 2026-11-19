@@ -5,8 +5,8 @@ that are firing on your MaxNines server, tells you when they start and resolve, 
 links to its web interface. It's the Linux version of MaxNines Desktop for Mac and
 Windows, and does the same things.
 
-It needs GTK 4.6 and libadwaita 1.1 or later: Ubuntu 22.04, Debian 12, Fedora 36 and
-anything newer.
+It runs on Ubuntu 22.04, Debian 12, Fedora, RHEL 10 and its rebuilds such as Rocky and
+AlmaLinux, and anything newer. RHEL 9's libraries are too old for it.
 
 ## Installing
 
@@ -16,7 +16,7 @@ Download the package for your system from
 
 ```sh
 sudo apt install ./maxnines-desktop_*.deb     # Debian, Ubuntu, Mint, Pop!_OS
-sudo dnf install ./maxnines-desktop-*.rpm     # Fedora, RHEL, Rocky, Alma
+sudo dnf install ./maxnines-desktop-*.rpm     # Fedora, RHEL 10, Rocky, Alma
 ```
 
 Either one installs what it needs, and adds MaxNines Desktop to your applications.

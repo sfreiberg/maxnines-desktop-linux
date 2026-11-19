@@ -24,8 +24,8 @@ serde_json = "1.0.154"
 tempfile = "3.27.0"
 
 # Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
-# already built, on Rocky Linux 9 so it runs everywhere these need: see
-# packaging/build.sh.
+# already built, on Ubuntu 22.04 so it runs everywhere these are for: see the Release
+# workflow. RHEL 9 isn't one, as its Pango is older than the GTK bindings need.
 [package.metadata.deb]
 name = "maxnines-desktop"
 maintainer = "MaxNines <https://github.com/sfreiberg/maxnines-desktop-linux/issues>"
@@ -34,7 +34,7 @@ license-file = ["../../LICENSE", "0"]
 extended-description = "A tray app for a MaxNines server's alerts: a tray icon that says the worst thing firing,\nnotifications as alerts start and resolve, and a window with the rest."
 section = "net"
 priority = "optional"
-depends = "libc6 (>= 2.34), libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.1)"
+depends = "libc6 (>= 2.35), libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.1)"
 assets = [
   ["target/release/maxnines-desktop", "usr/bin/", "755"],
   ["../../packaging/com.maxnines.Desktop.desktop", "usr/share/applications/", "644"],
@@ -56,6 +56,6 @@ assets = [
 auto-req = "no"
 
 [package.metadata.generate-rpm.requires]
-glibc = ">= 2.34"
+glibc = ">= 2.35"
 gtk4 = ">= 4.6"
 libadwaita = ">= 1.1"

@@ -52,12 +52,19 @@ jobs:
     strategy:
       matrix:
         include:
-          - { arch: x86_64, runner: ubuntu-24.04 }
-          - { arch: aarch64, runner: ubuntu-24.04-arm }
+          # Ubuntu 22.04 has the oldest C library of the systems the app is for, and
+          # GTK and libadwaita as old as it supports, so what's built here runs on
+          # all of them.
+          - { arch: x86_64, runner: ubuntu-22.04 }
+          - { arch: aarch64, runner: ubuntu-22.04-arm }
     steps:
       - uses: actions/checkout@v5
-      - name: Build on Rocky Linux 9
-        run: docker run --rm -v "$PWD:/work" -w /work rockylinux:9 sh packaging/build.sh
+      - name: Install GTK and libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p maxnines-desktop
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb,cargo-generate-rpm
@@ -92,7 +99,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "debian:13", "rockylinux:9", "fedora:latest"]
+        image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "debian:13", "almalinux:10", "fedora:latest"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
