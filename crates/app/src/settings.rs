@@ -134,11 +134,36 @@ pub mod autostart {
     fn entry(program: &Path) -> String {
         format!(
             "[Desktop Entry]\nType=Application\nName=MaxNines Desktop\n\
-             Comment=Your MaxNines server's alerts\nExec=\"{}\" --background\n\
+             Comment=Your MaxNines server's alerts\nExec={} --background\n\
              Icon={}\nX-GNOME-Autostart-enabled=true\n",
-            program.display(),
+            exec_argument(&program.to_string_lossy()),
             crate::APP_ID,
         )
+    }
+
+    /// `argument` as one argument of an `Exec=` line, quoted and escaped as the Desktop
+    /// Entry spec says, so a program in a folder with any name starts. Inside the
+    /// quotes, `"`, `` ` ``, `$` and `\` each take a backslash; then, as for any string
+    /// in the file, every backslash is doubled and a line break is written `\n`; and
+    /// `%` is doubled, as it would otherwise start a field code such as `%f`.
+    pub(super) fn exec_argument(argument: &str) -> String {
+        let mut quoted = String::from('"');
+        for character in argument.chars() {
+            match character {
+                '"' | '`' | '$' => {
+                    quoted.push_str("\\\\");
+                    quoted.push(character);
+                }
+                '\\' => quoted.push_str("\\\\\\\\"),
+                '%' => quoted.push_str("%%"),
+                '\n' => quoted.push_str("\\n"),
+                '\t' => quoted.push_str("\\t"),
+                '\r' => quoted.push_str("\\r"),
+                other => quoted.push(other),
+            }
+        }
+        quoted.push('"');
+        quoted
     }
 
     #[cfg(test)]
@@ -204,5 +229,21 @@ mod tests {
         assert!(!autostart::is_on_in(home.path()));
         // Turning off what's already off is fine.
         autostart::set_in(home.path(), false, program).unwrap();
+    }
+
+    #[test]
+    fn the_program_is_escaped_as_the_desktop_entry_spec_says() {
+        assert_eq!(
+            autostart::exec_argument("/usr/bin/maxnines-desktop"),
+            r#""/usr/bin/maxnines-desktop""#
+        );
+        // Each of `"`, `` ` ``, `$` and `\` is escaped for the quotes and then again
+        // for the file's strings, and `%` isn't read as a field code.
+        assert_eq!(
+            autostart::exec_argument(r#"/opt/My "Apps"/`x`/$HOME/a\b/100%/maxnines-desktop"#),
+            r#""/opt/My \\"Apps\\"/\\`x\\`/\\$HOME/a\\\\b/100%%/maxnines-desktop""#
+        );
+        // A line break would otherwise end the line.
+        assert_eq!(autostart::exec_argument("/tmp/a\nb"), r#""/tmp/a\nb""#);
     }
 }
