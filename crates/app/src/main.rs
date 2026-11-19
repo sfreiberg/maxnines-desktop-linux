@@ -38,6 +38,14 @@ pub enum Command {
 }
 
 fn main() -> glib::ExitCode {
+    // A window of lists and buttons doesn't need the GPU, and GTK's GL and Vulkan
+    // renderers hold on to a lot of memory for it, hundreds of megabytes on a virtual
+    // machine's software GL. So it draws with cairo, unless the person has chosen.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        // SAFETY: this is the start of main, before GTK starts or any thread is
+        // spawned, so nothing else can be reading the environment as it changes.
+        unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
+    }
     // Says what it is without starting, as the package tests use to check it runs.
     if std::env::args().any(|argument| argument == "--version") {
         println!("maxnines-desktop {}", env!("CARGO_PKG_VERSION"));

@@ -39,6 +39,10 @@ Without a tray, the app still notifies you, and closing its window quits it.
 With one, closing the window leaves the app in the tray, and frees the memory the
 window used until it's opened again.
 
+It draws its window with GTK's cairo renderer, which needs no GPU and much less
+memory than the others. To have it use another, start it with `GSK_RENDERER` set,
+such as `GSK_RENDERER=ngl maxnines-desktop`.
+
 ## Setting it up
 
 1. Open MaxNines Desktop. Its window opens on Settings until it's signed in.

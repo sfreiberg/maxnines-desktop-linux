@@ -10,8 +10,6 @@ set -eu
 program=$(realpath "${1:-target/release/maxnines-desktop}")
 home=$(mktemp -d)
 export HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_DATA_HOME="$home/.local/share"
-# A virtual display has no GPU, so GTK draws without one.
-export GSK_RENDERER=cairo
 
 "$program" --version
 
