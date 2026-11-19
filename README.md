@@ -36,6 +36,8 @@ KDE, Cinnamon, XFCE, MATE, Budgie and Ubuntu's GNOME show tray icons as they com
 GNOME desktops, such as Fedora's, need the
 [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
 Without a tray, the app still notifies you, and closing its window quits it.
+With one, closing the window leaves the app in the tray, and frees the memory the
+window used until it's opened again.
 
 ## Setting it up
 

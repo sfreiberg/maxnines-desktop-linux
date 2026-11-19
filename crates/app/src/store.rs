@@ -67,6 +67,7 @@ pub struct Store {
     answered: u64,
     commands: async_channel::Sender<Command>,
     tray: Option<ksni::blocking::Handle<Tray>>,
+    /// The window, while it's open.
     pub ui: Option<Ui>,
     app: adw::Application,
     /// Keeps the app running while its window is closed, when there's a tray to
@@ -115,9 +116,16 @@ impl Store {
     pub fn has_tray(&self) -> bool {
         self.tray.is_some()
     }
+
+    /// Whether it was signed in when it last ran, so has a sign-in to read from the
+    /// keyring, which happens after the start.
+    pub fn was_signed_in(&self) -> bool {
+        self.settings.user.is_some() && ServerAddress::parse(&self.settings.address).is_ok()
+    }
 }
 
-/// Starts the app: its tray, its window, and asking the server if it's signed in.
+/// Starts the app: its tray, and asking the server if it's signed in. The window is
+/// built when it's shown.
 pub fn start(app: &adw::Application) -> Shared {
     let (commands, received) = async_channel::unbounded();
     let connection = u64::try_from(now_ms()).unwrap_or_default();
@@ -164,8 +172,6 @@ pub fn start(app: &adw::Application) -> Shared {
         }
     }
     notify::learn_how_bodies_are_read();
-    let ui = Ui::build(app, &store);
-    store.borrow_mut().ui = Some(ui);
 
     let listening = store.clone();
     glib::spawn_future_local(async move {
@@ -323,10 +329,22 @@ fn set_account(settings: &mut Settings, account: Option<(String, String)>) {
     settings.save();
 }
 
+/// Shows the window, building it if it isn't open, as at the start or after it was
+/// closed.
 pub fn show(store: &Shared) {
-    if let Some(ui) = &store.borrow().ui {
-        ui.window.present();
-    }
+    let open = store.borrow().ui.as_ref().map(|ui| ui.window.clone());
+    let window = match open {
+        Some(window) => window,
+        None => {
+            let app = store.borrow().app.clone();
+            let ui = Ui::build(&app, store);
+            let window = ui.window.clone();
+            store.borrow_mut().ui = Some(ui);
+            render(store);
+            window
+        }
+    };
+    window.present();
 }
 
 /// Opens an address in the person's browser.

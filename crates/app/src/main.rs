@@ -67,7 +67,7 @@ fn main() -> glib::ExitCode {
             return;
         }
         let store = store::start(app);
-        let quietly = background && store.borrow().client.is_some() && store.borrow().has_tray();
+        let quietly = background && store.borrow().was_signed_in() && store.borrow().has_tray();
         if !quietly {
             store::show(&store);
         }

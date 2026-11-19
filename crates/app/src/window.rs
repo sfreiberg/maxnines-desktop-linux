@@ -200,14 +200,13 @@ impl Ui {
 
         {
             let store = store.clone();
-            window.connect_close_request(move |window| {
-                // With a tray to come back from, closing only hides it.
-                if store.borrow().has_tray() {
-                    window.set_visible(false);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
+            // Closed, the window goes, rather than hiding, so GTK lets go of what it
+            // draws with, which can be hundreds of megabytes. With a tray to come back
+            // from, the app keeps running, and builds it again when it's shown;
+            // without one, the app quits.
+            window.connect_close_request(move |_| {
+                store.borrow_mut().ui = None;
+                glib::Propagation::Proceed
             });
         }
         {
@@ -359,8 +358,14 @@ impl Ui {
             .halign(gtk::Align::Center)
             .css_classes(["pill", "suggested-action"])
             .build();
-        let stack = self.stack.clone();
-        open.connect_clicked(move |_| stack.set_visible_child_name("settings"));
+        // Held weakly, as the button is inside it, and a strong hold would keep the
+        // window's widgets alive after it's closed.
+        let stack = self.stack.downgrade();
+        open.connect_clicked(move |_| {
+            if let Some(stack) = stack.upgrade() {
+                stack.set_visible_child_name("settings");
+            }
+        });
         status.set_child(Some(&open));
         self.alerts.append(&status);
         Drawn {
