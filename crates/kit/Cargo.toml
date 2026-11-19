@@ -3,6 +3,7 @@ name = "maxnines-desktop-kit"
 description = "What MaxNines Desktop for Linux knows without a desktop: the server's API, signing in, and what's worth a notification"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

@@ -78,3 +78,7 @@ cargo test --workspace     # runs the tests
 
 The `kit` crate holds everything that doesn't need a desktop: the API, signing in, and
 working out what's worth a notification. Its tests run anywhere, macOS included.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

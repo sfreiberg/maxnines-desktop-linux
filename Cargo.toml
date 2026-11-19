@@ -5,6 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 maxnines-desktop-kit = { path = "crates/kit" }

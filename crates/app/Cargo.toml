@@ -3,6 +3,7 @@ name = "maxnines-desktop"
 description = "MaxNines Desktop for Linux: your MaxNines server's alerts in the tray"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
