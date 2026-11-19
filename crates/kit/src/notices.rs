@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
+
 use crate::models::{Alerts, Severity};
 use crate::times::age;
 
@@ -51,7 +53,7 @@ const RESOLVED_MARK: &str = "🟢";
 /// What's worth a notification between `old` and `new`. The first time there's no
 /// old, and nothing is: what was already firing when the app started isn't news.
 /// Silenced alerts stay quiet, as they do everywhere else in MaxNines.
-pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now_ms: i64) -> Vec<Notice> {
+pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>) -> Vec<Notice> {
     let before: HashMap<i64, _> = old
         .open
         .iter()
@@ -115,7 +117,7 @@ pub fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now_ms: i64) -> Vec
             let Some(done) = resolved.get(&alert.id) else {
                 continue;
             };
-            let lasted = age(done.started_ms, done.resolved_ms.unwrap_or(now_ms));
+            let lasted = age(done.started_at, done.resolved_at.unwrap_or(now));
             // Where things stand now, so it doesn't read as the problem again. One
             // closed for another reason has only what was wrong, said as past.
             let outcome = done
@@ -165,10 +167,15 @@ fn gathered(notices: Vec<Notice>, title: String) -> Vec<Notice> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use chrono::TimeDelta;
+
     use super::*;
     use crate::models::ServerAlert;
 
-    const NOW: i64 = 1_793_940_300_000;
+    /// Just after the alerts these tests make.
+    pub(crate) fn now() -> DateTime<Utc> {
+        "2026-11-06T04:45:00Z".parse().unwrap()
+    }
 
     pub(crate) fn alert(id: i64, severity: Severity) -> ServerAlert {
         ServerAlert {
@@ -180,8 +187,8 @@ pub(crate) mod tests {
             hostname: format!("host-{id}"),
             series: String::new(),
             summary: format!("Alert {id}"),
-            started_ms: 1_793_940_000_000,
-            resolved_ms: None,
+            started_at: now() - TimeDelta::minutes(5),
+            resolved_at: None,
             resolved_summary: None,
             acknowledged_by: None,
             silence_id: None,
@@ -200,8 +207,8 @@ pub(crate) mod tests {
             self
         }
 
-        pub(crate) fn resolved(mut self, at_ms: i64, summary: Option<&str>) -> Self {
-            self.resolved_ms = Some(at_ms);
+        pub(crate) fn resolved(mut self, at: DateTime<Utc>, summary: Option<&str>) -> Self {
+            self.resolved_at = Some(at);
             self.resolved_summary = summary.map(Into::into);
             self
         }
@@ -233,7 +240,7 @@ pub(crate) mod tests {
             alert(3, Severity::Warning),
             alert(4, Severity::Critical).silenced(),
         ]);
-        let all = notices(&old, &new, EVERYTHING, NOW);
+        let all = notices(&old, &new, EVERYTHING, now());
         // Not the one already firing, nor the silenced one.
         assert_eq!(titles(&all), ["🔴 Critical: Rule 2", "🟡 Warning: Rule 3"]);
         assert_eq!(all[0].body, "Alert 2");
@@ -246,7 +253,7 @@ pub(crate) mod tests {
             resolved: false,
         };
         assert_eq!(
-            titles(&notices(&old, &new, critical_only, NOW)),
+            titles(&notices(&old, &new, critical_only, now())),
             ["🔴 Critical: Rule 2"]
         );
         let nothing = NotifyWhen {
@@ -254,19 +261,19 @@ pub(crate) mod tests {
             warnings: false,
             resolved: false,
         };
-        assert!(notices(&old, &new, nothing, NOW).is_empty());
+        assert!(notices(&old, &new, nothing, now()).is_empty());
     }
 
     #[test]
     fn an_alert_that_gets_worse_is_notified() {
         let old = open(vec![alert(1, Severity::Warning)]);
         let new = open(vec![alert(1, Severity::Critical).acknowledged()]);
-        let all = notices(&old, &new, EVERYTHING, NOW);
+        let all = notices(&old, &new, EVERYTHING, now());
         assert_eq!(titles(&all), ["🔴 Now critical: Rule 1"]);
         // Someone's already on it.
         assert_eq!(all[0].acknowledges, None);
         // Getting better isn't news.
-        assert!(notices(&new, &old, EVERYTHING, NOW).is_empty());
+        assert!(notices(&new, &old, EVERYTHING, now()).is_empty());
     }
 
     #[test]
@@ -281,11 +288,11 @@ pub(crate) mod tests {
         ]);
         // As the server tells people then, and as what it is now, not how it changed.
         assert_eq!(
-            titles(&notices(&old, &new, EVERYTHING, NOW)),
+            titles(&notices(&old, &new, EVERYTHING, now())),
             ["🔴 Critical: Rule 1", "🔴 Critical: Rule 2"]
         );
         // Still silenced, it stays quiet.
-        assert!(notices(&old, &old, EVERYTHING, NOW).is_empty());
+        assert!(notices(&old, &old, EVERYTHING, now()).is_empty());
     }
 
     #[test]
@@ -300,13 +307,13 @@ pub(crate) mod tests {
             open: vec![],
             resolved: vec![
                 alert(1, Severity::Critical)
-                    .resolved(1_793_940_180_000, Some("host-1 is back online")),
+                    .resolved(now() - TimeDelta::minutes(2), Some("host-1 is back online")),
                 alert(3, Severity::Critical)
-                    .resolved(1_793_940_180_000, Some("host-3 is back online")),
-                alert(4, Severity::Warning).resolved(1_793_940_060_000, None),
+                    .resolved(now() - TimeDelta::minutes(2), Some("host-3 is back online")),
+                alert(4, Severity::Warning).resolved(now() - TimeDelta::minutes(4), None),
             ],
         };
-        let all = notices(&old, &new, EVERYTHING, NOW);
+        let all = notices(&old, &new, EVERYTHING, now());
         // The second just went, which the server doesn't call resolved, and the third
         // was silenced.
         assert_eq!(titles(&all), ["🟢 Resolved: Rule 1", "🟢 Resolved: Rule 4"]);
@@ -319,14 +326,14 @@ pub(crate) mod tests {
             resolved: false,
             ..EVERYTHING
         };
-        assert!(notices(&old, &new, no_resolved, NOW).is_empty());
+        assert!(notices(&old, &new, no_resolved, now()).is_empty());
     }
 
     #[test]
     fn a_storm_becomes_one_notification() {
         let old = Alerts::default();
         let new = open((1..=5).map(|id| alert(id, Severity::Critical)).collect());
-        let all = notices(&old, &new, EVERYTHING, NOW);
+        let all = notices(&old, &new, EVERYTHING, now());
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].title, "🔴 5 alerts started");
         assert_eq!(all[0].body, "Alert 1\nAlert 2\nAlert 3\nand 2 more");
@@ -335,21 +342,23 @@ pub(crate) mod tests {
         // Only warnings say so.
         let warnings = open((1..=5).map(|id| alert(id, Severity::Warning)).collect());
         assert_eq!(
-            notices(&old, &warnings, EVERYTHING, NOW)[0].title,
+            notices(&old, &warnings, EVERYTHING, now())[0].title,
             "🟡 5 alerts started"
         );
         let over = Alerts {
             open: vec![],
             resolved: (1..=5)
-                .map(|id| alert(id, Severity::Critical).resolved(1_793_940_180_000, None))
+                .map(|id| {
+                    alert(id, Severity::Critical).resolved(now() - TimeDelta::minutes(2), None)
+                })
                 .collect(),
         };
         assert_eq!(
-            titles(&notices(&new, &over, EVERYTHING, NOW)),
+            titles(&notices(&new, &over, EVERYTHING, now())),
             ["🟢 5 alerts resolved"]
         );
         // Three at once are each shown.
         let three = open((1..=3).map(|id| alert(id, Severity::Critical)).collect());
-        assert_eq!(notices(&old, &three, EVERYTHING, NOW).len(), 3);
+        assert_eq!(notices(&old, &three, EVERYTHING, now()).len(), 3);
     }
 }

@@ -5,9 +5,10 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use adw::prelude::*;
+use chrono::{DateTime, Utc};
 use gtk::glib;
 use maxnines_desktop_kit::overview::SilenceRow;
-use maxnines_desktop_kit::times::{age, now_ms, time_left};
+use maxnines_desktop_kit::times::{age, time_left};
 use maxnines_desktop_kit::{Overview, ServerAddress, ServerAlert, Severity};
 
 use crate::settings::{INTERVALS, Settings, autostart};
@@ -337,7 +338,7 @@ impl Ui {
             });
         }
         if let Some(drawn) = drawn.as_ref() {
-            drawn.update(state, now_ms());
+            drawn.update(state, Utc::now());
         }
     }
 
@@ -503,7 +504,7 @@ enum Timed {
 
 impl Drawn {
     /// Brings its times up to date.
-    fn update(&self, state: &Store, now: i64) {
+    fn update(&self, state: &Store, now: DateTime<Utc>) {
         if let Some(headline) = &self.headline {
             headline.set_subtitle(&glib::markup_escape_text(&answered(state)));
         }
@@ -514,11 +515,11 @@ impl Drawn {
 }
 
 impl Timed {
-    fn detail(&self, now: i64) -> String {
+    fn detail(&self, now: DateTime<Utc>) -> String {
         match self {
             Self::Firing(alert) => {
                 let mut detail =
-                    format!("{} · {} ago", alert.rule_name, age(alert.started_ms, now));
+                    format!("{} · {} ago", alert.rule_name, age(alert.started_at, now));
                 if let Some(who) = &alert.acknowledged_by {
                     detail.push_str(&format!(" · acknowledged by {who}"));
                 }
@@ -530,10 +531,10 @@ impl Timed {
             Self::Resolved(alert) => format!(
                 "{} · {} ago",
                 alert.rule_name,
-                age(alert.resolved_ms.unwrap_or(alert.started_ms), now)
+                age(alert.resolved_at.unwrap_or(alert.started_at), now)
             ),
             Self::Silence(silence) => {
-                let ends = format!("ends in {}", time_left(silence.ends_ms, now));
+                let ends = format!("ends in {}", time_left(silence.ends_at, now));
                 if silence.reason.is_empty() {
                     ends
                 } else {
@@ -675,27 +676,31 @@ fn firing_row(alert: &ServerAlert, busy: bool, store: &Shared) -> adw::ActionRow
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeDelta;
     use maxnines_desktop_kit::Alerts;
 
     use super::*;
 
-    const NOW: i64 = 1_793_940_300_000;
+    /// Just after the alerts below.
+    fn now() -> DateTime<Utc> {
+        "2026-11-06T04:45:00Z".parse().unwrap()
+    }
 
     fn alerts(acknowledged_by: Option<&str>) -> Alerts {
         serde_json::from_value(serde_json::json!({
             "open": [{"id": 7, "rule_id": 1, "rule_name": "High CPU", "severity": "critical",
                       "host_id": "abc", "hostname": "web-1", "summary": "High CPU on web-1",
-                      "started_ms": NOW - 600_000, "resolved_ms": null,
+                      "started_at": "2026-11-06T04:35:00Z", "resolved_at": null,
                       "acknowledged_by": acknowledged_by}],
             "resolved": [{"id": 5, "rule_id": 2, "rule_name": "Host offline",
                           "severity": "critical", "host_id": "def", "hostname": "db-1",
-                          "summary": "db-1 is offline", "started_ms": NOW - 900_000,
-                          "resolved_ms": NOW - 300_000, "acknowledged_by": null}]
+                          "summary": "db-1 is offline", "started_at": "2026-11-06T04:30:00Z",
+                          "resolved_at": "2026-11-06T04:40:00Z", "acknowledged_by": null}]
         }))
         .unwrap()
     }
 
-    fn shown(alerts: &Alerts, now: i64, busy: &[i64]) -> Shown {
+    fn shown(alerts: &Alerts, now: DateTime<Utc>, busy: &[i64]) -> Shown {
         let overview = Overview::new(alerts, &[], None, &[], now);
         Shown {
             signed_in: true,
@@ -712,24 +717,27 @@ mod tests {
     fn the_same_news_later_isnt_drawn_again() {
         // Another check, 15 seconds on, with nothing new: only times change, in place.
         assert_eq!(
-            shown(&alerts(None), NOW, &[]),
-            shown(&alerts(None), NOW + 15_000, &[])
+            shown(&alerts(None), now(), &[]),
+            shown(&alerts(None), now() + TimeDelta::seconds(15), &[])
         );
     }
 
     #[test]
     fn news_or_a_request_starting_or_ending_is_drawn_again() {
-        let before = shown(&alerts(None), NOW, &[]);
-        assert_ne!(before, shown(&alerts(Some("sam@example.com")), NOW, &[]));
+        let before = shown(&alerts(None), now(), &[]);
+        assert_ne!(before, shown(&alerts(Some("sam@example.com")), now(), &[]));
         // Its buttons go off while it's acknowledged or silenced, and on after.
-        assert_ne!(before, shown(&alerts(None), NOW, &[7]));
+        assert_ne!(before, shown(&alerts(None), now(), &[7]));
         let failed = Shown {
             action_problem: Some("The server answered with status 500".into()),
             ..before.clone()
         };
         assert_ne!(before, failed);
         // The resolved alert dropping out of the last hour.
-        assert_ne!(before, shown(&alerts(None), NOW + 3_600_000, &[]));
+        assert_ne!(
+            before,
+            shown(&alerts(None), now() + TimeDelta::hours(1), &[])
+        );
     }
 
     #[test]
@@ -737,16 +745,19 @@ mod tests {
         let alerts = alerts(Some("sam@example.com"));
         let firing = Timed::Firing(alerts.open[0].clone());
         assert_eq!(
-            firing.detail(NOW),
+            firing.detail(now()),
             format!(
                 "High CPU · {} ago · acknowledged by sam@example.com",
-                age(NOW - 600_000, NOW)
+                age(now() - TimeDelta::minutes(10), now())
             )
         );
         let resolved = Timed::Resolved(alerts.resolved[0].clone());
         assert_eq!(
-            resolved.detail(NOW + 60_000),
-            format!("Host offline · {} ago", age(NOW - 300_000, NOW + 60_000))
+            resolved.detail(now() + TimeDelta::minutes(1)),
+            format!(
+                "Host offline · {} ago",
+                age(now() - TimeDelta::minutes(5), now() + TimeDelta::minutes(1))
+            )
         );
     }
 }

@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use adw::prelude::*;
+use chrono::Utc;
 use gtk::{gio, glib};
 use ksni::blocking::TrayMethods;
 use maxnines_desktop_kit::client::AccessTokens;
 use maxnines_desktop_kit::http::Ureq;
 use maxnines_desktop_kit::models::{MonitoredHost, RemoteCheck};
 use maxnines_desktop_kit::signin::{self, SignInEndpoints};
-use maxnines_desktop_kit::times::now_ms;
 use maxnines_desktop_kit::{
     Alerts, Client, Error, Notice, Overview, ServerAddress, ServerAlert, Silences, TokenHolder,
     Tokens, notices,
@@ -128,7 +128,9 @@ impl Store {
 /// built when it's shown.
 pub fn start(app: &adw::Application) -> Shared {
     let (commands, received) = async_channel::unbounded();
-    let connection = u64::try_from(now_ms()).unwrap_or_default();
+    // Counted from the clock, so a notification from an earlier run of the app names
+    // a connection that's never current again.
+    let connection = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
     let store = Rc::new(RefCell::new(Store {
         settings: Settings::load(),
         client: None,
@@ -506,7 +508,7 @@ async fn asked(store: &Shared) {
     state.answered = ask_number;
     match result {
         Ok(answers) => {
-            let now = now_ms();
+            let now = Utc::now();
             state.overview = Some(Overview::new(
                 &answers.alerts,
                 &answers.hosts,

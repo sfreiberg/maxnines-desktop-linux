@@ -1,11 +1,14 @@
 //! What the app shows, worked out from what the server lists.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
+
+use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::models::{Alerts, MonitoredHost, RemoteCheck, ServerAlert, Severity, Silence};
 
 /// How far back resolved alerts are shown.
-const RECENTLY_MS: i64 = 3_600_000;
+const RECENTLY: TimeDelta = TimeDelta::hours(1);
 /// More than this many resolved alerts is a list nobody reads.
 const MOST_RESOLVED: usize = 5;
 
@@ -29,28 +32,23 @@ impl Overview {
         hosts: &[MonitoredHost],
         checks: Option<&[RemoteCheck]>,
         silences: &[Silence],
-        now_ms: i64,
+        now: DateTime<Utc>,
     ) -> Self {
         let mut firing = alerts.open.clone();
         firing.sort_by(|left, right| {
             right
                 .severity
                 .cmp(&left.severity)
-                .then(right.started_ms.cmp(&left.started_ms))
+                .then(right.started_at.cmp(&left.started_at))
         });
-        let since = now_ms - RECENTLY_MS;
+        let since = now - RECENTLY;
         let mut resolved: Vec<ServerAlert> = alerts
             .resolved
             .iter()
-            .filter(|alert| alert.resolved_ms.unwrap_or(0) >= since)
+            .filter(|alert| alert.resolved_at.is_some_and(|at| at >= since))
             .cloned()
             .collect();
-        resolved.sort_by(|left, right| {
-            right
-                .resolved_ms
-                .unwrap_or(0)
-                .cmp(&left.resolved_ms.unwrap_or(0))
-        });
+        resolved.sort_by_key(|alert| Reverse(alert.resolved_at));
         resolved.truncate(MOST_RESOLVED);
         let counted: Vec<&MonitoredHost> = hosts.iter().filter(|host| host.is_counted()).collect();
         // Alerts are the only place this app learns a rule's name.
@@ -61,7 +59,7 @@ impl Overview {
             }
         }
         let mut silences = silences.to_vec();
-        silences.sort_by_key(|silence| silence.ends_ms);
+        silences.sort_by_key(|silence| silence.ends_at);
         Self {
             firing,
             resolved,
@@ -156,7 +154,7 @@ pub struct SilenceRow {
     pub reason: String,
     /// What it keeps quiet, such as `High CPU on web-1`.
     pub covers: String,
-    pub ends_ms: i64,
+    pub ends_at: DateTime<Utc>,
 }
 
 impl SilenceRow {
@@ -195,7 +193,7 @@ impl SilenceRow {
             id: silence.id,
             reason: silence.reason.clone(),
             covers,
-            ends_ms: silence.ends_ms,
+            ends_at: silence.ends_at,
         }
     }
 }
@@ -204,9 +202,7 @@ impl SilenceRow {
 mod tests {
     use super::*;
     use crate::models::Latest;
-    use crate::notices::tests::alert;
-
-    const NOW: i64 = 1_793_940_300_000;
+    use crate::notices::tests::{alert, now};
 
     fn host(id: &str, online: bool) -> MonitoredHost {
         MonitoredHost {
@@ -223,7 +219,7 @@ mod tests {
     #[test]
     fn the_worst_comes_first_and_old_news_goes() {
         let mut older = alert(1, Severity::Critical);
-        older.started_ms -= 60_000;
+        older.started_at -= TimeDelta::minutes(1);
         let alerts = Alerts {
             open: vec![
                 older,
@@ -231,20 +227,20 @@ mod tests {
                 alert(3, Severity::Critical),
             ],
             resolved: vec![
-                alert(4, Severity::Critical).resolved(NOW - 60_000, None),
-                alert(5, Severity::Critical).resolved(NOW - 2 * RECENTLY_MS, None),
-                alert(6, Severity::Warning).resolved(NOW - 10_000, None),
+                alert(4, Severity::Critical).resolved(now() - TimeDelta::minutes(1), None),
+                alert(5, Severity::Critical).resolved(now() - RECENTLY * 2, None),
+                alert(6, Severity::Warning).resolved(now() - TimeDelta::seconds(10), None),
             ],
         };
         let hosts = [host("a", true), host("b", false)];
-        let overview = Overview::new(&alerts, &hosts, None, &[], NOW);
+        let overview = Overview::new(&alerts, &hosts, None, &[], now());
         let ids = |alerts: &[ServerAlert]| alerts.iter().map(|alert| alert.id).collect::<Vec<_>>();
         assert_eq!(ids(&overview.firing), [3, 1, 2]);
         assert_eq!(ids(&overview.resolved), [6, 4]);
         assert_eq!((overview.hosts_online, overview.hosts), (1, 2));
         assert_eq!(overview.headline(), "2 critical, 1 warning");
         assert_eq!(overview.worst(), Some(Severity::Critical));
-        let quiet = Overview::new(&Alerts::default(), &hosts, None, &[], NOW);
+        let quiet = Overview::new(&Alerts::default(), &hosts, None, &[], now());
         assert_eq!(quiet.headline(), "Nothing firing");
         assert_eq!(quiet.worst(), None);
     }
@@ -276,7 +272,7 @@ mod tests {
             filter: filter.into(),
             series: series.into(),
             reason: "deploy".into(),
-            ends_ms: NOW + id * 1000,
+            ends_at: now() + TimeDelta::seconds(id),
         };
         let alerts = Alerts {
             open: vec![alert(1, Severity::Critical)],
@@ -292,7 +288,7 @@ mod tests {
                 silence(3, Some(99), "", ""),
                 silence(2, Some(1), "id=a", "/var"),
             ],
-            NOW,
+            now(),
         );
         let covers: Vec<&str> = overview
             .silences

@@ -1,6 +1,7 @@
 //! What the server's API lists. Fields the app doesn't use are left out, and the
 //! server may add more.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 
 /// How bad an alert is, mildest first, so the worse of two is the greater.
@@ -46,8 +47,8 @@ pub struct ServerAlert {
     pub series: String,
     /// What was wrong, as it said when it fired.
     pub summary: String,
-    pub started_ms: i64,
-    pub resolved_ms: Option<i64>,
+    pub started_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
     /// Where things stood as it cleared, such as "web-1 is back online". Missing for
     /// one closed for another reason, such as its rule being deleted, and from older
     /// servers.
@@ -112,7 +113,7 @@ pub struct Silence {
     pub series: String,
     #[serde(default)]
     pub reason: String,
-    pub ends_ms: i64,
+    pub ends_at: DateTime<Utc>,
 }
 
 /// What `GET /api/v1/silences` returns. Ones that have ended aren't used.
@@ -182,17 +183,17 @@ mod tests {
             r#"{"open": [
                  {"id": 7, "rule_id": 1, "rule_name": "High CPU", "severity": "critical",
                   "host_id": "abc", "hostname": "web-1", "series": "", "value": 97.2,
-                  "summary": "High CPU on web-1", "started_ms": 1793940279545,
-                  "resolved_ms": null, "resolve_reason": null, "acknowledged_by": null,
+                  "summary": "High CPU on web-1", "started_at": "2026-11-06T04:44:39.545Z",
+                  "resolved_at": null, "resolve_reason": null, "acknowledged_by": null,
                   "silence_id": null, "maintenance_window_id": null},
                  {"id": 8, "rule_id": null, "rule_name": "Something new", "severity": "emergency",
                   "host_id": "abc", "hostname": "web-1", "summary": "Something new",
-                  "started_ms": 1793940100000, "resolved_ms": null, "acknowledged_by": "sam@example.com"}],
+                  "started_at": "2026-11-06T04:41:40Z", "resolved_at": null, "acknowledged_by": "sam@example.com"}],
                "resolved": [
                  {"id": 5, "rule_id": 2, "rule_name": "Host offline", "severity": "critical",
                   "host_id": "def", "hostname": "db-1", "series": "",
-                  "summary": "db-1 is offline", "started_ms": 1793936000000,
-                  "resolved_ms": 1793939000000, "resolved_summary": "db-1 is back online",
+                  "summary": "db-1 is offline", "started_at": "2026-11-06T03:33:20Z",
+                  "resolved_at": "2026-11-06T04:23:20Z", "resolved_summary": "db-1 is back online",
                   "acknowledged_by": null, "silence_id": null, "maintenance_window_id": null}]}"#,
         )
         .unwrap();
@@ -205,6 +206,28 @@ mod tests {
         assert_eq!(alerts.open[0].says_now(), "High CPU on web-1");
         assert_eq!(alerts.resolved[0].says_now(), "db-1 is back online");
         assert_eq!(alerts.resolved[0].page(), "/hosts/def");
+    }
+
+    #[test]
+    fn times_are_read_with_milliseconds_and_without() {
+        let ends = |ends_at: serde_json::Value| {
+            serde_json::from_value::<Silence>(serde_json::json!({
+                "id": 1, "rule_id": null, "ends_at": ends_at
+            }))
+            .map(|silence| silence.ends_at)
+        };
+        // To the millisecond, which is as precise as the server keeps them.
+        assert_eq!(
+            ends("2026-11-19T01:57:17.828Z".into()).unwrap(),
+            DateTime::from_timestamp_millis(1_795_053_437_828).unwrap()
+        );
+        // The server leaves the fraction out when the milliseconds are zero.
+        assert_eq!(
+            ends("2026-11-19T02:30:00Z".into()).unwrap(),
+            DateTime::from_timestamp(1_795_055_400, 0).unwrap()
+        );
+        // Milliseconds since 1970, as older servers sent, aren't a time.
+        assert!(ends(1_795_053_437_828_i64.into()).is_err());
     }
 
     #[test]
