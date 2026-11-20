@@ -15,7 +15,7 @@ pub mod signin;
 pub mod times;
 pub mod tokens;
 
-pub use client::{Client, Listed, ServerAddress};
+pub use client::{Client, Extras, Listed, ServerAddress};
 pub use error::Error;
 pub use models::{Alerts, MonitoredHost, RemoteCheck, ServerAlert, Severity, Silence, Silences};
 pub use notices::{Notice, Notifier, NotifyWhen};

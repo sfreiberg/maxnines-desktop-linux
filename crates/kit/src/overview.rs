@@ -249,6 +249,19 @@ mod tests {
     }
 
     #[test]
+    fn the_same_news_later_is_the_same_overview() {
+        let alerts = Alerts {
+            open: vec![alert(1, Severity::Critical)],
+            resolved: vec![alert(2, Severity::Warning).resolved(now(), None)],
+        };
+        let at = |later| Overview::new(&alerts, &[host("a", true)], None, &[], now() + later);
+        // Another check, 15 seconds on, with nothing new: the app only changes times.
+        assert_eq!(at(TimeDelta::seconds(15)), at(TimeDelta::zero()));
+        // The resolved alert dropping out of the last hour is news.
+        assert_ne!(at(RECENTLY + TimeDelta::seconds(1)), at(TimeDelta::zero()));
+    }
+
+    #[test]
     fn only_checks_that_arent_paused_are_counted() {
         let check = |id, enabled, latest: Option<bool>| RemoteCheck {
             id,

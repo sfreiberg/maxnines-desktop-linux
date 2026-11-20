@@ -17,7 +17,7 @@ use maxnines_desktop_kit::http::Ureq;
 use maxnines_desktop_kit::signin::{self, SignInEndpoints};
 use maxnines_desktop_kit::tokens::Save;
 use maxnines_desktop_kit::{
-    Client, Error, Listed, Notice, Notifier, Overview, ServerAddress, ServerAlert, Severity,
+    Client, Error, Extras, Notice, Notifier, Overview, ServerAddress, ServerAlert, Severity,
     TokenHolder, Tokens,
 };
 
@@ -36,11 +36,15 @@ pub struct Store {
     /// What the server last listed. Kept while a later try fails, as old news that
     /// says it's old beats none.
     pub overview: Option<Overview>,
+    /// Counts each change to `overview`, so the window builds its alerts page again
+    /// only when there's news, without keeping a copy to compare.
+    pub overview_changes: u64,
     pub updated: Option<glib::DateTime>,
     /// Why the server couldn't be asked, if it couldn't.
     pub problem: Option<String>,
-    /// Why the last acknowledge or silence didn't work.
-    pub action_problem: Option<String>,
+    /// Why the last acknowledge or silence didn't work, and the alert it was for. It's
+    /// old news once that alert stops firing, or the sign-in ends.
+    pub action_problem: Option<(i64, String)>,
     /// The alerts an acknowledge or silence is running for.
     pub busy: BTreeSet<i64>,
     /// Set while waiting for the person to sign in in the browser; setting what it
@@ -57,12 +61,12 @@ pub struct Store {
     keeping: bool,
     /// What's worth a notification, worked out from what the server listed.
     notifier: Notifier,
-    /// What the server listed last time, whose checks and silences are kept while
-    /// asking for them again fails.
-    listed: Option<Listed>,
+    /// The checks and silences the server listed last time, kept while asking for
+    /// them again fails.
+    extras: Arc<Extras>,
     /// Counts each sign-in, sign-out and change of server, so an answer for the old
-    /// one, or a notification about it, is dropped. It starts from when the app did,
-    /// so a notification from a run before isn't taken for one about this.
+    /// one, or a notification about it, is dropped. It starts somewhere random, so a
+    /// notification from a run before isn't taken for one about this.
     connection: u64,
     /// The same, for the threads that keep the refresh token, so one for a connection
     /// that's ended leaves the keyring be.
@@ -143,14 +147,16 @@ impl Store {
 /// built when it's shown.
 pub fn start(app: &adw::Application) -> Shared {
     let (commands, received) = async_channel::unbounded();
-    // Counted from the clock, so a notification from an earlier run of the app names
-    // a connection that's never current again.
-    let connection = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+    // From somewhere random, so a notification from an earlier run of the app names a
+    // connection that's never current again, whatever the clock has done since. There
+    // are billions of starts to choose from, each with billions of connections after.
+    let connection = u64::from(glib::random_int()) << 32;
     let store = Rc::new(RefCell::new(Store {
         settings: Settings::load(),
         client: None,
         holder: None,
         overview: None,
+        overview_changes: 0,
         updated: None,
         problem: None,
         action_problem: None,
@@ -161,7 +167,7 @@ pub fn start(app: &adw::Application) -> Shared {
         keep_problem: None,
         keeping: false,
         notifier: Notifier::default(),
-        listed: None,
+        extras: Arc::default(),
         connection,
         current: Arc::new(AtomicU64::new(connection)),
         asks: 0,
@@ -282,56 +288,73 @@ fn keyring_problem(error: &str, wait: u32) -> String {
     )
 }
 
-/// Signs in to `server` as the refresh token saved in the keyring says, if there is
-/// one. A keyring that can't be read yet, as at login before its service has started
-/// or while it's locked, is tried again, waiting longer each time, rather than taken
-/// for having nothing in it.
+/// Waits `wait` seconds before something's tried again, then doubles it for the next
+/// time, up to `most`. Whether `connection` is still current after, as nothing is
+/// tried for a sign-in that's since ended.
+async fn waited(store: &Shared, connection: u64, wait: &mut u32, most: u32) -> bool {
+    glib::timeout_future_seconds(*wait).await;
+    *wait = (*wait * 2).min(most);
+    store.borrow().connection == connection
+}
+
+/// Signs in to `server` as the refresh token saved in the keyring for it says, if
+/// there is one. A keyring that can't be read yet, as at login before its service has
+/// started or while it's locked, is tried again, waiting longer each time, rather than
+/// taken for having nothing in it.
 fn sign_in_as_saved(store: &Shared, server: ServerAddress) {
     let store = store.clone();
     glib::spawn_future_local(async move {
         let started = store.borrow().connection;
         let mut wait = KEYRING_RETRY_FIRST;
         loop {
-            let read = gio::spawn_blocking(secrets::refresh_token)
+            let reading = server.clone();
+            let read = gio::spawn_blocking(move || secrets::refresh_token(&reading))
                 .await
                 .unwrap_or_else(|_| Err("reading it stopped".into()));
-            let saved = {
-                let mut state = store.borrow_mut();
-                match read {
-                    // Signed in meanwhile, what was saved is old news.
-                    _ if state.connection != started => {
-                        state.keyring_problem = None;
-                        Ok(None)
-                    }
-                    Ok(saved) => {
-                        state.keyring_problem = None;
-                        Ok(saved)
-                    }
-                    Err(error) => {
-                        eprintln!("couldn't read the keyring, trying again in {wait} s: {error}");
-                        state.keyring_problem = Some(keyring_problem(&error, wait));
-                        Err(())
-                    }
-                }
-            };
-            match saved {
-                Ok(saved) => {
-                    if let Some(refresh_token) = saved {
-                        connect(&store, server, |endpoints, save| {
-                            TokenHolder::saved(refresh_token, endpoints, save)
-                        });
-                    }
+            // Signed in or out meanwhile, what was saved is old news.
+            if store.borrow().connection != started {
+                return;
+            }
+            match read {
+                Ok(Some(refresh_token)) => {
+                    connect(&store, server, |endpoints, save| {
+                        TokenHolder::saved(refresh_token, endpoints, save)
+                    });
                     render(&store);
                     return;
                 }
-                Err(()) => {
-                    render(&store);
-                    glib::timeout_future_seconds(wait).await;
-                    wait = (wait * 2).min(KEYRING_RETRY_MOST);
+                Ok(None) => {
+                    nothing_saved(&store);
+                    return;
                 }
+                Err(error) => {
+                    eprintln!("couldn't read the keyring, trying again in {wait} s: {error}");
+                    store.borrow_mut().keyring_problem = Some(keyring_problem(&error, wait));
+                    render(&store);
+                }
+            }
+            if !waited(&store, started, &mut wait, KEYRING_RETRY_MOST).await {
+                return;
             }
         }
     });
+}
+
+/// The keyring has no sign-in for the server, though the settings may say there was
+/// one when the app last ran: it isn't signed in, and the next start knows it. Started
+/// at login to wait in the tray, the window opens instead, to say so.
+fn nothing_saved(store: &Shared) {
+    let mut state = store.borrow_mut();
+    state.keyring_problem = None;
+    let was_signed_in = state.settings.user.is_some();
+    set_account(&mut state.settings, None);
+    let closed = state.ui.is_none();
+    drop(state);
+    if was_signed_in && closed {
+        show(store);
+    } else {
+        render(store);
+    }
 }
 
 fn handle(store: &Shared, command: Command) {
@@ -400,8 +423,13 @@ pub fn pressed(store: &Shared, pressed: Pressed) {
     }
 }
 
+/// Remembers who's signed in, saving it only when that's changed, as a refresh tells
+/// it each time.
 fn set_account(settings: &mut Settings, account: Option<(String, String)>) {
     let (user, role) = account.unzip();
+    if settings.user == user && settings.role == role {
+        return;
+    }
     settings.user = user;
     settings.role = role;
     settings.save();
@@ -479,14 +507,24 @@ pub fn render(store: &Shared) {
     }
 }
 
-/// Stops asking the server, and forgets what it said.
+/// Sets what the server last listed, counting it as a change only if it is one.
+fn set_overview(state: &mut Store, overview: Option<Overview>) {
+    if state.overview != overview {
+        state.overview = overview;
+        state.overview_changes += 1;
+    }
+}
+
+/// Stops asking the server, and forgets what it said, and what went wrong with it.
 fn disconnect(state: &mut Store) {
     state.problem = None;
-    state.overview = None;
+    set_overview(state, None);
     state.updated = None;
     // Another server's alerts aren't news about this one's.
     state.notifier = Notifier::default();
-    state.listed = None;
+    state.extras = Arc::default();
+    state.action_problem = None;
+    state.keyring_problem = None;
     state.keep_problem = None;
     state.keeping = false;
     state.connection += 1;
@@ -510,8 +548,9 @@ fn connect(
     // date, unless this sign-in has since ended. This runs on the thread that
     // refreshed, before the new token is used. One that can't be kept is tried again
     // until it is, as the next start would otherwise use the one it replaced.
+    let keeping_for = server.clone();
     let save: Save = Box::new(move |tokens: Option<&Tokens>| {
-        let token = tokens.map(|tokens| tokens.refresh_token.as_str());
+        let token = tokens.map(|tokens| (&keeping_for, tokens.refresh_token.as_str()));
         let kept = secrets::set_refresh_token(token, connection, &current);
         if let Err(error) = &kept {
             eprintln!("couldn't update the keyring: {error}");
@@ -562,11 +601,13 @@ async fn asked(store: &Shared) {
             return;
         };
         state.asks += 1;
-        (client, state.listed.clone(), state.connection, state.asks)
+        (client, state.extras.clone(), state.connection, state.asks)
     };
-    let Ok(result) = gio::spawn_blocking(move || client.listed(last.as_ref())).await else {
-        return;
-    };
+    // One that panicked says so, rather than leaving what was listed before looking
+    // current.
+    let result = gio::spawn_blocking(move || client.listed(&last))
+        .await
+        .unwrap_or(Err(Error::Stopped));
     let mut state = store.borrow_mut();
     // Overtaken by a later answer, or for a sign-in that's since ended, it says
     // nothing about the server now.
@@ -577,21 +618,31 @@ async fn asked(store: &Shared) {
     match result {
         Ok(listed) => {
             let now = Utc::now();
-            state.overview = Some(Overview::new(
+            let overview = Overview::new(
                 &listed.alerts,
                 &listed.hosts,
-                listed.checks.as_deref(),
-                listed.silences.as_deref().unwrap_or_default(),
+                listed.extras.checks.as_deref(),
+                listed.extras.silences.as_deref().unwrap_or_default(),
                 now,
-            ));
+            );
+            set_overview(&mut state, Some(overview));
             state.updated = glib::DateTime::now_local().ok();
             state.problem = None;
+            // An acknowledge or silence that didn't work is old news once its alert
+            // has stopped firing.
+            let stopped_firing = state
+                .action_problem
+                .as_ref()
+                .is_some_and(|(alert, _)| !listed.alerts.open.iter().any(|open| open.id == *alert));
+            if stopped_firing {
+                state.action_problem = None;
+            }
             let when = state.settings.notify_when();
             let notices = state.notifier.notices(&listed.alerts, when, now);
             for notice in &notices {
                 notify::post(&state.app, notice, connection);
             }
-            state.listed = Some(listed);
+            state.extras = Arc::new(listed.extras);
         }
         Err(Error::SignedOut) => signed_out(&mut state),
         Err(error) => state.problem = Some(error.to_string()),
@@ -687,16 +738,20 @@ pub fn sign_in(store: &Shared, typed: &str) {
         // Whatever was signed in before ends first, so nothing it does can touch the
         // keyring once this sign-in's token is kept there, and that's kept before
         // anything uses it. It's still signing in meanwhile, which lasts while the
-        // keyring asks to be unlocked.
+        // keyring asks to be unlocked. The address is saved first, so if the app
+        // stops before it's signed in, the next start looks for this server's token.
         let (connection, current) = {
             let mut state = store.borrow_mut();
             disconnect(&mut state);
+            state.settings.address = typed;
+            state.settings.save();
             (state.connection, state.current.clone())
         };
         let token = tokens.refresh_token.clone();
         let keeping = current.clone();
+        let keeping_for = server.clone();
         let kept = gio::spawn_blocking(move || {
-            secrets::set_refresh_token(Some(&token), connection, &keeping)
+            secrets::set_refresh_token(Some((&keeping_for, &token)), connection, &keeping)
         })
         .await
         .unwrap_or_else(|_| Err("keeping it stopped".into()));
@@ -712,7 +767,6 @@ pub fn sign_in(store: &Shared, typed: &str) {
         let mut state = store.borrow_mut();
         state.signing_in = None;
         state.sign_in_problem = None;
-        state.settings.address = typed;
         set_account(
             &mut state.settings,
             Some((tokens.user.clone(), tokens.role.clone())),
@@ -786,11 +840,7 @@ fn not_kept(store: &Shared, connection: u64, error: &str) {
     let store = store.clone();
     glib::spawn_future_local(async move {
         let mut wait = KEEP_RETRY_FIRST;
-        loop {
-            glib::timeout_future_seconds(wait).await;
-            if store.borrow().connection != connection {
-                return;
-            }
+        while waited(&store, connection, &mut wait, KEEP_RETRY_MOST).await {
             let trying = holder.clone();
             let kept = gio::spawn_blocking(move || trying.keep_again())
                 .await
@@ -812,7 +862,6 @@ fn not_kept(store: &Shared, connection: u64, error: &str) {
             if !store.borrow().keeping {
                 return;
             }
-            wait = (wait * 2).min(KEEP_RETRY_MOST);
         }
     });
 }
@@ -899,17 +948,18 @@ fn act(
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || action(&client))
             .await
-            .unwrap_or(Err(Error::Cancelled));
+            .unwrap_or(Err(Error::Stopped));
+        if let Err(error) = &result {
+            failed(&error.to_string());
+        }
         {
             let mut state = store.borrow_mut();
-            match &result {
-                Ok(()) => state.action_problem = None,
-                Err(error) => {
-                    state.action_problem = Some(error.to_string());
-                    failed(&error.to_string());
-                    if *error == Error::SignedOut && state.connection == connection {
-                        signed_out(&mut state);
-                    }
+            // For a sign-in that's since ended, it says nothing about the one now.
+            if state.connection == connection {
+                match &result {
+                    Ok(()) => state.action_problem = None,
+                    Err(Error::SignedOut) => signed_out(&mut state),
+                    Err(error) => state.action_problem = Some((alert, error.to_string())),
                 }
             }
         }

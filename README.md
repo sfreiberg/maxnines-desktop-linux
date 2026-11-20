@@ -109,8 +109,8 @@ you've quit the app starts it, with its window open.
 ## Open at login
 
 Turn on **Open at login** in its settings. It then starts in the tray when you sign in,
-without opening its window. If no panel shows its icon within a minute, it opens its
-window instead.
+without opening its window. If no panel shows its icon within a minute, or it finds
+it's no longer signed in, it opens its window instead.
 
 ## Building
 

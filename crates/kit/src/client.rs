@@ -40,6 +40,11 @@ impl ServerAddress {
         })
     }
 
+    /// The root of the site, such as `https://monitor.example.com/`.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
     /// A page of the web interface, such as `/alerts`.
     pub fn page(&self, path: &str) -> String {
         format!("{}{}", self.root, path.trim_start_matches('/'))
@@ -57,6 +62,13 @@ impl ServerAddress {
 pub struct Listed {
     pub alerts: Alerts,
     pub hosts: Vec<MonitoredHost>,
+    pub extras: Extras,
+}
+
+/// What the server is asked for besides alerts and hosts. What one round listed is
+/// handed to the next, which keeps it while asking again fails for now.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Extras {
     /// The server's own checks. None when it can't list them: one too old to, or a
     /// sign-in not allowed to.
     pub checks: Option<Vec<RemoteCheck>>,
@@ -143,13 +155,13 @@ impl Client {
     /// silences are extras: when asking for them fails for now, what `last` had is
     /// kept, so they don't seem to end for a round. A sign-in that's run out ends the
     /// round, whichever request found out.
-    pub fn listed(&self, last: Option<&Listed>) -> Result<Listed, Error> {
+    pub fn listed(&self, last: &Extras) -> Result<Listed, Error> {
         let (alerts, hosts, checks, silences) = std::thread::scope(|scope| {
-            let hosts = scope.spawn(|| self.hosts());
-            let checks = scope.spawn(|| self.remote_checks());
-            let silences = scope.spawn(|| self.silences());
+            let hosts = alongside(scope, || self.hosts());
+            let checks = alongside(scope, || self.remote_checks());
+            let silences = alongside(scope, || self.silences());
             let alerts = self.alerts();
-            (alerts, joined(hosts), joined(checks), joined(silences))
+            (alerts, hosts.join(), checks.join(), silences.join())
         });
         let signed_out = [
             alerts.as_ref().err(),
@@ -164,11 +176,10 @@ impl Client {
         Ok(Listed {
             alerts: alerts?,
             hosts: hosts?,
-            checks: kept(checks, last.and_then(|last| last.checks.clone())),
-            silences: kept(
-                silences.map(|silences| silences.active),
-                last.and_then(|last| last.silences.clone()),
-            ),
+            extras: Extras {
+                checks: kept(checks, &last.checks),
+                silences: kept(silences.map(|silences| silences.active), &last.silences),
+            },
         })
     }
 
@@ -190,22 +201,45 @@ impl Client {
     }
 }
 
-/// What a thread of [`Client::listed`] found. One that panicked panics here too, as it
-/// would have had it run on this thread.
-fn joined<T>(thread: std::thread::ScopedJoinHandle<'_, T>) -> T {
-    thread
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+/// A request of [`Client::listed`], on a thread of its own alongside the others, or
+/// later on the thread that asked, if the system can't start another.
+enum Alongside<'scope, T, F> {
+    Running(std::thread::ScopedJoinHandle<'scope, T>),
+    Later(F),
+}
+
+fn alongside<'scope, T: Send + 'scope, F: FnOnce() -> T + Send + Clone + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    request: F,
+) -> Alongside<'scope, T, F> {
+    match std::thread::Builder::new().spawn_scoped(scope, request.clone()) {
+        Ok(thread) => Alongside::Running(thread),
+        Err(_) => Alongside::Later(request),
+    }
+}
+
+impl<T, F: FnOnce() -> T> Alongside<'_, T, F> {
+    /// What it found. One whose thread panicked panics here too, as it would have had
+    /// it run on this thread.
+    fn join(self) -> T {
+        match self {
+            Self::Running(thread) => thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Self::Later(request) => request(),
+        }
+    }
 }
 
 /// What to show of an extra the server was asked for: what it listed; nothing when it
 /// can't list it at all, being too old to or the sign-in not allowed to; or what it
-/// listed last time, when asking failed only for now.
-fn kept<T>(fresh: Result<T, Error>, last: Option<T>) -> Option<T> {
+/// listed last time, when asking failed only for now, as when a proxy in front of it
+/// answers with a page of its own for a while.
+fn kept<T: Clone>(fresh: Result<T, Error>, last: &Option<T>) -> Option<T> {
     match fresh {
         Ok(listed) => Some(listed),
-        Err(Error::NotAllowed(_) | Error::Status(404) | Error::NotMaxNines) => None,
-        Err(_) => last,
+        Err(Error::NotAllowed(_) | Error::Status(404)) => None,
+        Err(_) => last.clone(),
     }
 }
 
@@ -275,6 +309,7 @@ mod tests {
             server.page("/alerts"),
             "https://monitor.example.com:8443/alerts"
         );
+        assert_eq!(server.root(), "https://monitor.example.com:8443/");
         assert!(!server.is_in_the_clear());
         assert!(
             ServerAddress::parse("http://192.168.0.155:9000")
@@ -382,19 +417,20 @@ mod tests {
                 _ => answer(SILENCES.0, SILENCES.1),
             }
         }));
-        let listed = client(fake).listed(None).unwrap();
-        assert_eq!(listed.checks.unwrap().len(), 1);
-        assert_eq!(listed.silences.unwrap()[0].id, 3);
+        let listed = client(fake).listed(&Extras::default()).unwrap();
+        assert_eq!(listed.extras.checks.unwrap().len(), 1);
+        assert_eq!(listed.extras.silences.unwrap()[0].id, 3);
     }
 
     #[test]
     fn extras_that_cant_be_asked_for_now_are_kept_from_last_time() {
         let last = client(lists([ALERTS, HOSTS, CHECKS, SILENCES]))
-            .listed(None)
+            .listed(&Extras::default())
             .unwrap();
-        // A server that's struggling keeps what it said last time.
-        let struggling = client(lists([ALERTS, HOSTS, (500, ""), (502, "")]))
-            .listed(Some(&last))
+        // A server that's struggling keeps what it said last time, as does one behind
+        // a proxy that answers with a page of its own for a while.
+        let struggling = client(lists([ALERTS, HOSTS, (500, ""), (200, "<html>")]))
+            .listed(&last.extras)
             .unwrap();
         assert_eq!(struggling, last);
         // One that can't list them at all, being too old or the sign-in not allowed
@@ -405,12 +441,12 @@ mod tests {
             (403, r#"{"error": "Not allowed"}"#),
             (404, ""),
         ]))
-        .listed(Some(&last))
+        .listed(&last.extras)
         .unwrap();
-        assert_eq!((cant.checks, cant.silences), (None, None));
+        assert_eq!(cant.extras, Extras::default());
         // Without the alerts or hosts there's nothing to show.
         assert_eq!(
-            client(lists([(500, ""), HOSTS, CHECKS, SILENCES])).listed(Some(&last)),
+            client(lists([(500, ""), HOSTS, CHECKS, SILENCES])).listed(&last.extras),
             Err(Error::Status(500))
         );
     }
@@ -436,7 +472,7 @@ mod tests {
             Arc::new(RunOut),
             fake,
         );
-        assert_eq!(client.listed(None), Err(Error::SignedOut));
+        assert_eq!(client.listed(&Extras::default()), Err(Error::SignedOut));
     }
 
     #[test]

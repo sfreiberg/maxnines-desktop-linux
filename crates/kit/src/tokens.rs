@@ -13,12 +13,44 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::Error;
-use crate::client::AccessTokens;
+use crate::client::{AccessTokens, ServerAddress};
 use crate::signin::{SignInEndpoints, Tokens};
 
-/// How long before the access token runs out that a new one is fetched.
+/// How long before the access token runs out that a new one is fetched, at most.
 const EARLY: Duration = Duration::from_secs(60);
+
+/// When an access token that works for `lifetime` from `issued` is replaced: `EARLY`
+/// before it runs out, or halfway through a lifetime too short for that, so a server
+/// that hands out short ones doesn't have every request refresh.
+fn use_until(issued: Instant, lifetime: Duration) -> Instant {
+    issued + lifetime - EARLY.min(lifetime / 2)
+}
+
+/// A refresh token as the keyring keeps it: with the server it's for, so it's only ever
+/// sent back to that server, whatever the app's settings say by the time it's read.
+#[derive(Serialize, Deserialize)]
+struct Kept {
+    server: String,
+    refresh_token: String,
+}
+
+/// What the keyring keeps for `refresh_token`, which is for `server`.
+pub fn kept(server: &ServerAddress, refresh_token: &str) -> String {
+    serde_json::to_string(&Kept {
+        server: server.root().to_string(),
+        refresh_token: refresh_token.to_string(),
+    })
+    .unwrap_or_default()
+}
+
+/// The refresh token in what the keyring kept, if it's for `server`.
+pub fn kept_for(kept: &str, server: &ServerAddress) -> Option<String> {
+    let kept: Kept = serde_json::from_str(kept).ok()?;
+    (ServerAddress::parse(&kept.server).ok()? == *server).then_some(kept.refresh_token)
+}
 
 /// How long to wait before each new try when a refresh fails for any reason but being
 /// signed out. They all fall within the minute the server still takes a refresh token
@@ -44,6 +76,7 @@ type Sleep = Box<dyn Fn(Duration) + Send + Sync>;
 
 struct State {
     refresh_token: Option<String>,
+    /// The access token, and when it's replaced.
     access: Option<(String, Instant)>,
     /// Set once signing out starts, after which nothing refreshes.
     signing_out: bool,
@@ -72,7 +105,7 @@ impl TokenHolder {
             let mut state = holder.state.lock().unwrap();
             state.access = Some((
                 tokens.access_token.clone(),
-                Instant::now() + Duration::from_secs(tokens.expires_in),
+                use_until(Instant::now(), Duration::from_secs(tokens.expires_in)),
             ));
             state.unkept = (!kept).then(|| tokens.clone());
         }
@@ -154,8 +187,8 @@ impl TokenHolder {
     /// The access token, if it isn't about to run out.
     fn current(&self) -> Option<String> {
         let state = self.state.lock().unwrap();
-        let (token, expires) = state.access.as_ref()?;
-        (expires.saturating_duration_since((self.now)()) > EARLY).then(|| token.clone())
+        let (token, until) = state.access.as_ref()?;
+        ((self.now)() < *until).then(|| token.clone())
     }
 
     /// Refreshes, unless another refresh brought a token other than `rejected` while
@@ -198,7 +231,7 @@ impl TokenHolder {
         state.refresh_token = Some(tokens.refresh_token.clone());
         state.access = Some((
             tokens.access_token.clone(),
-            (self.now)() + Duration::from_secs(tokens.expires_in),
+            use_until((self.now)(), Duration::from_secs(tokens.expires_in)),
         ));
         Ok(tokens.access_token)
     }
@@ -375,6 +408,44 @@ mod tests {
         assert_eq!(holder.access_token().unwrap(), "access-1");
         later.store(900 - 59, Ordering::SeqCst);
         assert_eq!(holder.access_token().unwrap(), "access-2");
+    }
+
+    #[test]
+    fn a_short_lived_access_token_is_used_for_half_its_life() {
+        let short = r#"{"access_token": "access-1", "expires_in": 60, "refresh_token": "r",
+                        "role": "responder", "user": "sam@example.com"}"#;
+        let fake = Arc::new(Fake::new(|_| answer(200, &issued(2))));
+        let (_, save) = saving();
+        let tokens: Tokens = serde_json::from_str(short).unwrap();
+        let mut holder = TokenHolder::signed_in(&tokens, true, endpoints(fake.clone()), save);
+        let later = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let at = later.clone();
+        holder.now = Box::new(move || start + Duration::from_secs(at.load(Ordering::SeqCst)));
+        // Rather than refreshing for every request, as it's never a minute from
+        // running out.
+        assert_eq!(holder.access_token().unwrap(), "access-1");
+        later.store(29, Ordering::SeqCst);
+        assert_eq!(holder.access_token().unwrap(), "access-1");
+        assert!(fake.sent().is_empty());
+        later.store(31, Ordering::SeqCst);
+        assert_eq!(holder.access_token().unwrap(), "access-2");
+    }
+
+    #[test]
+    fn a_kept_refresh_token_is_only_for_the_server_it_came_from() {
+        let server = |address| ServerAddress::parse(address).unwrap();
+        let here = server("https://monitor.example.com");
+        let kept = kept(&here, "refresh-1");
+        // Whatever page of it the settings name.
+        assert_eq!(
+            kept_for(&kept, &server("https://monitor.example.com/alerts")),
+            Some("refresh-1".into())
+        );
+        assert_eq!(kept_for(&kept, &server("https://other.example.com")), None);
+        assert_eq!(kept_for(&kept, &server("http://monitor.example.com")), None);
+        // A bare token, which says nothing of where it's from.
+        assert_eq!(kept_for("refresh-1", &here), None);
     }
 
     #[test]

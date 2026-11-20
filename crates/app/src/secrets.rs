@@ -1,5 +1,6 @@
 //! The refresh token, kept in the desktop's keyring through the Secret Service, as
-//! GNOME Keyring and KWallet both provide. The access token is only ever in memory.
+//! GNOME Keyring and KWallet both provide, with the server it's for. The access token
+//! is only ever in memory.
 //!
 //! Every call can wait on the Secret Service, or on the person answering its unlock
 //! prompt, so none is made on GTK's thread.
@@ -9,6 +10,8 @@ use std::sync::{Mutex, PoisonError};
 
 use keyring_core::Entry;
 use keyring_core::api::CredentialStoreApi;
+use maxnines_desktop_kit::ServerAddress;
+use maxnines_desktop_kit::tokens::{kept, kept_for};
 
 const SERVICE: &str = "MaxNines Desktop";
 const ACCOUNT: &str = "refresh-token";
@@ -26,29 +29,32 @@ fn entry() -> Result<Entry, keyring_core::Error> {
     zbus_secret_service_keyring_store::Store::new()?.build(SERVICE, ACCOUNT, None)
 }
 
-/// The saved refresh token, nothing if there isn't one, or why the keyring couldn't
-/// be read, such as it being locked or its service not having started yet.
-pub fn refresh_token() -> Result<Option<String>, String> {
+/// The saved refresh token for `server`, nothing if there isn't one for it, or why
+/// the keyring couldn't be read, such as it being locked or its service not having
+/// started yet. One for another server, kept as signing in to that one was cut short,
+/// is never sent to this one.
+pub fn refresh_token(server: &ServerAddress) -> Result<Option<String>, String> {
     match entry().and_then(|entry| entry.get_password()) {
-        Ok(token) => Ok(Some(token)),
+        Ok(kept) => Ok(kept_for(&kept, server)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
 }
 
-/// Keeps `token`, or forgets the one kept when given nothing, for the sign-in on
-/// `connection`, unless `current` has since moved on from it: a sign-out finishing
-/// late, or a refresh for a sign-in that's been replaced, leaves the newer one's
-/// token be. Says why if the keyring couldn't be changed.
+/// Keeps `token`, a refresh token for the server with it, or forgets the one kept
+/// when given nothing, for the sign-in on `connection`, unless `current` has since
+/// moved on from it: a sign-out finishing late, or a refresh for a sign-in that's been
+/// replaced, leaves the newer one's token be. Says why if the keyring couldn't be
+/// changed.
 pub fn set_refresh_token(
-    token: Option<&str>,
+    token: Option<(&ServerAddress, &str)>,
     connection: u64,
     current: &AtomicU64,
 ) -> Result<(), String> {
     let changed = if_current(connection, current, || {
         let entry = entry()?;
         match token {
-            Some(token) => entry.set_password(token),
+            Some((server, token)) => entry.set_password(&kept(server, token)),
             None => match entry.delete_credential() {
                 Err(keyring_core::Error::NoEntry) => Ok(()),
                 other => other,

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use gtk::glib;
 use maxnines_desktop_kit::overview::SilenceRow;
 use maxnines_desktop_kit::times::{age, time_left};
-use maxnines_desktop_kit::{Overview, ServerAddress, ServerAlert, Severity};
+use maxnines_desktop_kit::{ServerAddress, ServerAlert, Severity};
 
 use crate::settings::{INTERVALS, Settings, autostart};
 use crate::store::{self, Shared, Store};
@@ -431,7 +431,8 @@ impl Ui {
         }
         self.alerts.append(&summary);
 
-        for problem in [&state.keep_problem, &state.action_problem]
+        let action_problem = state.action_problem.as_ref().map(|(_, said)| said);
+        for problem in [state.keep_problem.as_ref(), action_problem]
             .into_iter()
             .flatten()
         {
@@ -500,7 +501,8 @@ pub struct Shown {
     signed_in: bool,
     headline: String,
     keyring_problem: Option<String>,
-    overview: Option<Overview>,
+    /// How many times what the server listed has changed.
+    overview_changes: u64,
     problem: Option<String>,
     keep_problem: Option<String>,
     action_problem: Option<String>,
@@ -514,10 +516,10 @@ impl Shown {
             signed_in: state.client.is_some(),
             headline: state.headline(),
             keyring_problem: state.keyring_problem.clone(),
-            overview: state.overview.clone(),
+            overview_changes: state.overview_changes,
             problem: state.problem.clone(),
             keep_problem: state.keep_problem.clone(),
-            action_problem: state.action_problem.clone(),
+            action_problem: state.action_problem.as_ref().map(|(_, said)| said.clone()),
             busy: state.busy.clone(),
         }
     }
@@ -740,13 +742,12 @@ mod tests {
         .unwrap()
     }
 
-    fn shown(alerts: &Alerts, now: DateTime<Utc>, busy: &[i64]) -> Shown {
-        let overview = Overview::new(alerts, &[], None, &[], now);
+    fn shown(overview_changes: u64, busy: &[i64]) -> Shown {
         Shown {
             signed_in: true,
-            headline: overview.headline(),
+            headline: "1 critical".into(),
             keyring_problem: None,
-            overview: Some(overview),
+            overview_changes,
             problem: None,
             keep_problem: None,
             action_problem: None,
@@ -755,30 +756,18 @@ mod tests {
     }
 
     #[test]
-    fn the_same_news_later_isnt_drawn_again() {
-        // Another check, 15 seconds on, with nothing new: only times change, in place.
-        assert_eq!(
-            shown(&alerts(None), now(), &[]),
-            shown(&alerts(None), now() + TimeDelta::seconds(15), &[])
-        );
-    }
-
-    #[test]
     fn news_or_a_request_starting_or_ending_is_drawn_again() {
-        let before = shown(&alerts(None), now(), &[]);
-        assert_ne!(before, shown(&alerts(Some("sam@example.com")), now(), &[]));
+        let before = shown(3, &[]);
+        assert_eq!(before, shown(3, &[]));
+        // What the server listed changed.
+        assert_ne!(before, shown(4, &[]));
         // Its buttons go off while it's acknowledged or silenced, and on after.
-        assert_ne!(before, shown(&alerts(None), now(), &[7]));
+        assert_ne!(before, shown(3, &[7]));
         let failed = Shown {
             action_problem: Some("The server answered with status 500".into()),
             ..before.clone()
         };
         assert_ne!(before, failed);
-        // The resolved alert dropping out of the last hour.
-        assert_ne!(
-            before,
-            shown(&alerts(None), now() + TimeDelta::hours(1), &[])
-        );
     }
 
     #[test]

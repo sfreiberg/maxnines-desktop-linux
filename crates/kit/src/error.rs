@@ -41,4 +41,7 @@ pub enum Error {
     /// Signing in was cancelled.
     #[error("Signing in was cancelled")]
     Cancelled,
+    /// What was asking the server stopped partway, which is a bug in the app.
+    #[error("Asking the server stopped partway, which is a bug in the app")]
+    Stopped,
 }
