@@ -1,34 +1,33 @@
+# Formatting, lints and tests on every pull request and on main. A commit on a
+# branch with a pull request runs once, for the pull request, and a newer push
+# cancels the run for the one before it. Building the packages, running the app on
+# a desktop and installing it on each system wait for a version tag (release.yml).
 name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The oldest GTK 4.6 and libadwaita 1.1 the app supports.
-          - { name: Ubuntu 22.04, runner: ubuntu-22.04 }
-          - { name: Ubuntu 24.04, runner: ubuntu-24.04 }
-          - { name: Ubuntu 24.04 Arm, runner: ubuntu-24.04-arm }
+    name: Tests
+    # The oldest GTK 4.6 and libadwaita 1.1 the app supports.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
-      - name: Install GTK, libadwaita, and a display and session bus to run it on
+      - name: Install GTK and libadwaita
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev \
-            xvfb xauth dbus libglib2.0-bin
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo build --release --locked
-      - name: Start it as a desktop would
-        run: packaging/smoke-test.sh target/release/maxnines-desktop

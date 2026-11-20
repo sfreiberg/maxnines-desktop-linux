@@ -8,19 +8,14 @@
 # "MaxNines Desktop for Linux 1.2.3", with notes from the commits, its files, and
 # their SHA256SUMS.
 #
-# A pull request that changes the packaging runs everything but publishing, so it's
-# known to work before a tag needs it. So does starting it by hand from Actions.
+# Only a tag runs this, as it's the slow part: CI runs the tests on every pull
+# request. Starting it by hand from Actions runs everything but publishing, to try
+# a packaging change before a tag needs it.
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - packaging/**
-      - Cargo.toml
-      - crates/app/Cargo.toml
   workflow_dispatch:
 
 permissions:
@@ -68,12 +63,15 @@ jobs:
           - { arch: aarch64, runner: ubuntu-22.04-arm }
     steps:
       - uses: actions/checkout@v5
-      - name: Install GTK and libadwaita
+      - name: Install GTK, libadwaita, and a display and session bus to run it on
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev \
+            xvfb xauth dbus libglib2.0-bin
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked -p maxnines-desktop
+      - name: Start it as a desktop would
+        run: packaging/smoke-test.sh target/release/maxnines-desktop
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb,cargo-generate-rpm
