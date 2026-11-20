@@ -1,0 +1,66 @@
+[package]
+name = "maxnines-desktop"
+description = "MaxNines Desktop for Linux: your MaxNines server's alerts in the tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# libadwaita 1.1 and GTK 4.6 at the least, as Ubuntu 22.04 has.
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_1"] }
+async-channel = "2.5.0"
+chrono.workspace = true
+gethostname = "1.1.0"
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_6"] }
+# The Secret Service store itself, rather than the keyring crate's wrapper around it,
+# which tries to reach the service only once and remembers failing for good.
+keyring-core = "1.0.1"
+# Blocking, on its own thread, with no async runtime of ours to share.
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+maxnines-desktop-kit.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
+# already built, on Ubuntu 22.04 so it runs everywhere these are for: see the Release
+# workflow. RHEL 9 isn't one, as its Pango is older than the GTK bindings need.
+[package.metadata.deb]
+name = "maxnines-desktop"
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines-desktop-linux/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "A tray app for a MaxNines server's alerts: a tray icon that says the worst thing firing,\nnotifications as alerts start and resolve, and a window with the rest."
+section = "net"
+priority = "optional"
+depends = "libc6 (>= 2.35), libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.1)"
+assets = [
+  ["target/release/maxnines-desktop", "usr/bin/", "755"],
+  ["../../packaging/com.maxnines.Desktop.desktop", "usr/share/applications/", "644"],
+  ["../../packaging/com.maxnines.Desktop.service", "usr/share/dbus-1/services/", "644"],
+  ["../../packaging/com.maxnines.Desktop.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["../../README.md", "usr/share/doc/maxnines-desktop/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "maxnines-desktop"
+summary = "MaxNines Desktop: a MaxNines server's alerts in the tray"
+description = "A tray app for a MaxNines server's alerts: a tray icon that says the worst thing firing,\nnotifications as alerts start and resolve, and a window with the rest."
+assets = [
+  { source = "target/release/maxnines-desktop", dest = "/usr/bin/maxnines-desktop", mode = "755" },
+  { source = "../../packaging/com.maxnines.Desktop.desktop", dest = "/usr/share/applications/com.maxnines.Desktop.desktop", mode = "644" },
+  { source = "../../packaging/com.maxnines.Desktop.service", dest = "/usr/share/dbus-1/services/com.maxnines.Desktop.service", mode = "644" },
+  { source = "../../packaging/com.maxnines.Desktop.svg", dest = "/usr/share/icons/hicolor/scalable/apps/com.maxnines.Desktop.svg", mode = "644" },
+  { source = "../../README.md", dest = "/usr/share/doc/maxnines-desktop/README.md", mode = "644", doc = true },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-desktop/LICENSE", mode = "644", doc = true },
+]
+auto-req = "no"
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.35"
+gtk4 = ">= 4.6"
+libadwaita = ">= 1.1"

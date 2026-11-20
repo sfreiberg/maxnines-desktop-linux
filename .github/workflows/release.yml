@@ -1,0 +1,149 @@
+# Builds the Linux packages, installs each on the systems it's for, and publishes a
+# GitHub release when a version tag is pushed.
+#
+# Every MaxNines repo releases the same way. A tag v1.2.3 is a production release,
+# and v1.2.3-alpha.N, v1.2.3-beta.N or v1.2.3-rc.N a pre-release, published as one;
+# only production releases become the latest. The tag has to match the version in
+# the workspace Cargo.toml. Each release is titled
+# "MaxNines Desktop for Linux 1.2.3", with notes from the commits, its files, and
+# their SHA256SUMS.
+#
+# Only a tag runs this, as it's the slow part: CI runs the tests on every pull
+# request. A release runs them too, on the commit it releases, which nothing else
+# may have tested, and publishes only if they pass. Starting it by hand from Actions
+# runs everything but publishing, to try a packaging change before a tag needs it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  tests:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  check:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$'; then
+            echo "::error::$version can't be released: a version is 1.2.3, or 1.2.3-alpha.N, -beta.N or -rc.N"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml, $version"
+            exit 1
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  packages:
+    name: Packages for ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Ubuntu 22.04 has the oldest C library of the systems the app is for, and
+          # GTK and libadwaita as old as it supports, so what's built here runs on
+          # all of them.
+          - { arch: x86_64, runner: ubuntu-22.04 }
+          - { arch: aarch64, runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install GTK, libadwaita, and a display and session bus to run it on
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev \
+            xvfb xauth dbus libglib2.0-bin
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p maxnines-desktop
+      - name: Start it as a desktop would
+        run: packaging/smoke-test.sh target/release/maxnines-desktop
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Make the .deb, .rpm and .tar.gz
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p packages
+          cargo deb -p maxnines-desktop --no-build --no-strip -o packages/
+          # RPM versions can't contain "-". A "~" sorts a pre-release before the
+          # release, as cargo deb does for Debian.
+          cargo generate-rpm -p crates/app -s "version = \"$(echo "$VERSION" | tr - '~')\"" -o packages/
+          folder="maxnines-desktop-$VERSION"
+          mkdir -p "tarball/$folder"
+          cp target/release/maxnines-desktop packaging/com.maxnines.Desktop.desktop \
+            packaging/com.maxnines.Desktop.service packaging/com.maxnines.Desktop.svg \
+            README.md LICENSE "tarball/$folder/"
+          tar -czf "packages/maxnines-desktop-$VERSION-$ARCH-linux.tar.gz" -C tarball "$folder"
+          ls -l packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/
+
+  # Installs each package on the oldest of every system it's for, and the newest,
+  # and runs what it installed.
+  test-packages:
+    name: Install on ${{ matrix.image }} ${{ matrix.arch }}
+    needs: [check, packages]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "debian:13", "almalinux:10", "fedora:latest"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages
+      - run: >
+          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}"
+          sh packaging/test-install.sh "${{ needs.check.outputs.version }}"
+
+  publish:
+    name: Publish the release
+    if: github.ref_type == 'tag'
+    needs: [tests, check, test-packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: release
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release && sha256sum * > SHA256SUMS)
+          flags=
+          if [ "${{ needs.check.outputs.prerelease }}" = true ]; then
+            flags=--prerelease
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag release/* --repo "$GITHUB_REPOSITORY" \
+            --title "MaxNines Desktop for Linux ${{ needs.check.outputs.version }}" --generate-notes $flags

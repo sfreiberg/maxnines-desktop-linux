@@ -1,0 +1,24 @@
+[package]
+name = "maxnines-desktop-kit"
+description = "What MaxNines Desktop for Linux knows without a desktop: the server's API, signing in, and what's worth a notification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.23.1"
+chrono.workspace = true
+ring = "0.17.14"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_urlencoded = "0.7.1"
+thiserror = "2.0.21"
+# The system's trust store, so a server with a certificate from a company's own
+# certificate authority works once that is installed, as it does in a browser.
+ureq = { version = "3.5.2", default-features = false, features = [
+  "json",
+  "platform-verifier",
+  "rustls",
+] }
+url = "2.5.8"
