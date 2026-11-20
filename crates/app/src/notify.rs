@@ -7,9 +7,7 @@
 //! after signing in elsewhere, or after the app started again, does nothing to the
 //! server signed in now.
 
-use std::path::Path;
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -86,7 +84,7 @@ pub fn add_actions(app: &adw::Application, pressed: impl Fn(&adw::Application, P
 /// does its Open in MaxNines button.
 pub fn post(app: &adw::Application, notice: &Notice, connection: u64) {
     let notification = gio::Notification::new(&notice.title);
-    notification.set_body(Some(&body(&notice.body, bodies_are_markup())));
+    notification.set_body(Some(&body(&notice.body)));
     notification.set_icon(&gio::ThemedIcon::new(crate::APP_ID));
     let (open, open_target) = Pressed::Open {
         connection,
@@ -103,78 +101,12 @@ pub fn post(app: &adw::Application, notice: &Notice, connection: u64) {
     app.send_notification(Some(&notice.id), &notification);
 }
 
-/// `text` as the notification service reads a body.
-fn body(text: &str, markup: bool) -> String {
-    if markup {
-        glib::markup_escape_text(text).to_string()
-    } else {
-        text.to_string()
-    }
-}
-
-/// Whether bodies are read as markup, once that's known.
-static BODY_MARKUP: OnceLock<bool> = OnceLock::new();
-
-fn bodies_are_markup() -> bool {
-    BODY_MARKUP.get().copied().unwrap_or(false)
-}
-
-/// Finds out whether notification bodies are read as markup, on a thread of its own
-/// as it asks the session bus. Done once at the start, well before the first
-/// notification, which can only come with the server's second answer.
-pub fn learn_how_bodies_are_read() {
-    std::thread::spawn(|| {
-        let _ = BODY_MARKUP.set(ask_whether_bodies_are_markup());
-    });
-}
-
-/// GLib sends notifications to a portal when sandboxed or told to, or else to GNOME
-/// Shell's own service when it runs, and both read bodies as plain text. Only
-/// otherwise do they go as they are to the freedesktop service, which reads them as
-/// markup if it says it does.
-fn ask_whether_bodies_are_markup() -> bool {
-    if std::env::var_os("GIO_USE_PORTALS").is_some_and(|value| value == "1")
-        || Path::new("/.flatpak-info").exists()
-    {
-        return false;
-    }
-    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
-        return false;
-    };
-    // Both services are at the path their name spells, under the same interface.
-    let call = |name: &str, method: &str, arguments: Option<glib::Variant>, reply: &str| {
-        bus.call_sync(
-            Some(name),
-            &format!("/{}", name.replace('.', "/")),
-            name,
-            method,
-            arguments.as_ref(),
-            glib::VariantTy::new(reply).ok(),
-            gio::DBusCallFlags::NONE,
-            5000,
-            gio::Cancellable::NONE,
-        )
-        .ok()
-    };
-    let gnome_shell = call(
-        "org.freedesktop.DBus",
-        "NameHasOwner",
-        Some(("org.gtk.Notifications",).to_variant()),
-        "(b)",
-    )
-    .and_then(|reply| reply.get::<(bool,)>())
-    .is_some_and(|(owned,)| owned);
-    if gnome_shell {
-        return false;
-    }
-    call(
-        "org.freedesktop.Notifications",
-        "GetCapabilities",
-        None,
-        "(as)",
-    )
-    .and_then(|reply| reply.get::<(Vec<String>,)>())
-    .is_some_and(|(capabilities,)| capabilities.iter().any(|said| said == "body-markup"))
+/// `text` as a notification's body, reading the same whether the notification service
+/// takes it as plain text, as GNOME Shell does, or as markup, as the freedesktop
+/// services that say so do. Which one gets it is GLib's choice, which it doesn't
+/// share, so the two characters that start markup are sent as look-alikes that don't.
+fn body(text: &str) -> String {
+    text.replace('&', "\u{FF06}").replace('<', "\u{FF1C}")
 }
 
 #[cfg(test)]
@@ -182,13 +114,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_body_is_escaped_only_where_its_read_as_markup() {
-        let said = "Load on <db> & \"web\" is > 4";
-        assert_eq!(
-            body(said, true),
-            "Load on &lt;db&gt; &amp; &quot;web&quot; is &gt; 4"
-        );
-        assert_eq!(body(said, false), said);
+    fn a_body_reads_the_same_as_plain_text_or_markup() {
+        let said = body("Load on <db> & \"web\" is > 4");
+        assert_eq!(said, "Load on ＜db> ＆ \"web\" is > 4");
+        // As markup, it's all text, saying the same.
+        let (_, text, _) = gtk::pango::parse_markup(&said, '\0').unwrap();
+        assert_eq!(text.as_str(), said);
     }
 
     #[test]

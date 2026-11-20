@@ -93,7 +93,8 @@ alert resolves, each turned on or off in its settings. All three are on to begin
 Alerts that a silence or maintenance window is holding back never send one, as
 everywhere else in MaxNines, and one still firing when its silence ends sends one then.
 If you were told an alert started, you're still told when it resolves, even if it was
-silenced in between.
+silenced in between. Otherwise an alert's end is only news if you're notified when
+alerts like it start, so with critical alerts turned off, you don't hear one resolve.
 Nothing that was already firing when the app started is announced, and more than three
 at once arrive as one.
 

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::models::{Alerts, RESOLVED_MARK, Severity};
+use crate::models::{Alerts, RESOLVED_LISTED, RESOLVED_MARK, ServerAlert, Severity};
 use crate::times::age;
 
 /// Which changes someone wants a notification about.
@@ -19,12 +19,22 @@ impl NotifyWhen {
     pub fn any(&self) -> bool {
         self.critical || self.warnings || self.resolved
     }
+
+    /// Whether alerts of `severity` are wanted.
+    fn wants(&self, severity: Severity) -> bool {
+        match severity {
+            Severity::Critical => self.critical,
+            Severity::Warning => self.warnings,
+        }
+    }
 }
 
 /// One notification to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
-    /// Unique to the change, so the same one is never shown twice.
+    /// Unique to the change, as it names when it was noticed, so one never replaces
+    /// an earlier notification, even about the same alert, from another run of the
+    /// app or about another server.
     pub id: String,
     pub title: String,
     pub body: String,
@@ -43,9 +53,9 @@ const MOST: usize = 3;
 /// remembers who's been told what.
 #[derive(Debug, Clone, Default)]
 pub struct Notifier {
-    /// The alerts the server listed last time. Nothing until the first answer, so what
-    /// was already firing when the app started isn't news.
-    last: Option<Alerts>,
+    /// The alerts firing when the server last listed them. Nothing until the first
+    /// answer, so what was already firing when the app started isn't news.
+    last: Option<Vec<ServerAlert>>,
     /// The firing alerts the person has been told have started. Told about one, they
     /// still hear when it ends, even if it's been silenced since, as the server's own
     /// notifications do.
@@ -59,28 +69,24 @@ impl Notifier {
             Some(old) => worked_out(old, new, when, now, &mut self.told),
             None => Vec::new(),
         };
-        self.last = Some(new.clone());
+        self.last = Some(new.open.clone());
         notices
     }
 }
 
-/// What's worth a notification between `old` and `new`. Silenced alerts stay quiet,
-/// as they do everywhere else in MaxNines, except for the end of one the person was
-/// already told about. `told` is kept up to date.
+/// What's worth a notification between `old`, what was firing, and `new`. Silenced
+/// alerts stay quiet, as they do everywhere else in MaxNines, except for the end of one
+/// the person was already told about. `told` is kept up to date.
 fn worked_out(
-    old: &Alerts,
+    old: &[ServerAlert],
     new: &Alerts,
     when: NotifyWhen,
     now: DateTime<Utc>,
     told: &mut HashSet<i64>,
 ) -> Vec<Notice> {
-    let before: HashMap<i64, _> = old
-        .open
-        .iter()
-        .rev()
-        .map(|alert| (alert.id, alert))
-        .collect();
+    let before: HashMap<i64, _> = old.iter().rev().map(|alert| (alert.id, alert)).collect();
     let still: HashSet<i64> = new.open.iter().map(|alert| alert.id).collect();
+    let noticed = now.timestamp_millis();
 
     let mut started = Vec::new();
     let mut worst = Severity::Warning;
@@ -94,11 +100,7 @@ fn worked_out(
         if was.is_some() && !unsilenced && !worse {
             continue;
         }
-        let wanted = match alert.severity {
-            Severity::Critical => when.critical,
-            Severity::Warning => when.warnings,
-        };
-        if !wanted {
+        if !when.wants(alert.severity) {
             continue;
         }
         worst = worst.max(alert.severity);
@@ -112,7 +114,7 @@ fn worked_out(
             "Now critical"
         };
         started.push(Notice {
-            id: format!("alert-{}-{}", alert.id, alert.severity.as_str()),
+            id: format!("alert-{}-{}-{noticed}", alert.id, alert.severity.as_str()),
             title: format!("{} {level}: {}", alert.severity.mark(), alert.rule_name),
             body: alert.summary.clone(),
             acknowledges: (!alert.is_acknowledged()).then_some(alert.id),
@@ -128,24 +130,42 @@ fn worked_out(
             .rev()
             .map(|alert| (alert.id, alert))
             .collect();
-        for alert in old.open.iter().filter(|alert| {
-            !still.contains(&alert.id) && (!alert.is_silenced() || told.contains(&alert.id))
+        // The server lists only the latest ended alerts, newest started first, so one
+        // that started before all of a full list may have ended without being listed.
+        let listed_since = (new.resolved.len() >= RESOLVED_LISTED)
+            .then(|| new.resolved.iter().map(|alert| alert.started_at).min())
+            .flatten();
+        // Told it started, they hear it end, even if it's been silenced since.
+        // Otherwise it's only news if it isn't silenced and its severity is wanted,
+        // so nobody hears the end of something they chose not to hear start.
+        for alert in old.iter().filter(|alert| {
+            !still.contains(&alert.id)
+                && (told.contains(&alert.id)
+                    || (!alert.is_silenced() && when.wants(alert.severity)))
         }) {
-            // Only what the server says has resolved: one that's just gone, as when
-            // its host was deleted, isn't news worth telling.
-            let Some(done) = resolved.get(&alert.id) else {
-                continue;
-            };
             // From when the problem began, as the server's pages say it.
-            let lasted = age(done.breached_at, done.resolved_at.unwrap_or(now));
-            // Where things stand now, so it doesn't read as the problem again. One
-            // closed for another reason has only what was wrong, said as past.
-            let outcome = done
-                .resolved_summary
-                .clone()
-                .unwrap_or_else(|| format!("Was: {}", done.summary));
+            let (lasted, outcome) = match resolved.get(&alert.id) {
+                Some(done) => (
+                    age(done.breached_at, done.resolved_at.unwrap_or(now)),
+                    // Where things stand now, so it doesn't read as the problem again.
+                    // One closed for another reason has only what was wrong, said as
+                    // past.
+                    done.resolved_summary
+                        .clone()
+                        .unwrap_or_else(|| format!("Was: {}", done.summary)),
+                ),
+                // Ended, but too long after it started to be listed: it ended since the
+                // last listing, so about now.
+                None if listed_since.is_some_and(|since| alert.started_at <= since) => (
+                    age(alert.breached_at, now),
+                    format!("Was: {}", alert.summary),
+                ),
+                // Gone, as when its host was deleted, which the server doesn't call
+                // resolved, so it isn't news worth telling.
+                None => continue,
+            };
             ended.push(Notice {
-                id: format!("alert-{}-resolved", alert.id),
+                id: format!("alert-{}-resolved-{noticed}", alert.id),
                 title: format!("{RESOLVED_MARK} Resolved: {}", alert.rule_name),
                 body: format!("{outcome}\nLasted {lasted}"),
                 acknowledges: None,
@@ -246,7 +266,7 @@ pub(crate) mod tests {
 
     /// What's worth a notification from `old` to `new`, told about nothing before.
     fn notices(old: &Alerts, new: &Alerts, when: NotifyWhen, now: DateTime<Utc>) -> Vec<Notice> {
-        worked_out(old, new, when, now, &mut HashSet::new())
+        worked_out(&old.open, new, when, now, &mut HashSet::new())
     }
 
     fn titles(notices: &[Notice]) -> Vec<&str> {
@@ -393,6 +413,88 @@ pub(crate) mod tests {
         );
         // Once it's ended, it's forgotten.
         assert!(notifier.told.is_empty());
+    }
+
+    #[test]
+    fn each_change_has_a_notification_of_its_own() {
+        let mut notifier = Notifier::default();
+        let mut ids = Vec::new();
+        let mut at = now();
+        let mut listed = |alerts: Vec<ServerAlert>, notifier: &mut Notifier| {
+            at += TimeDelta::seconds(15);
+            let notices = notifier.notices(&open(alerts), EVERYTHING, at);
+            ids.extend(notices.into_iter().map(|notice| notice.id));
+        };
+        listed(vec![], &mut notifier);
+        // Critical, silenced, its silence over, a warning, critical again.
+        listed(vec![alert(7, Severity::Critical)], &mut notifier);
+        listed(vec![alert(7, Severity::Critical).silenced()], &mut notifier);
+        listed(vec![alert(7, Severity::Critical)], &mut notifier);
+        listed(vec![alert(7, Severity::Warning)], &mut notifier);
+        listed(vec![alert(7, Severity::Critical)], &mut notifier);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        // None replaces another, which a desktop may do without showing it again.
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 3, "{ids:?}");
+        assert!(ids[0].starts_with("alert-7-critical-"), "{ids:?}");
+    }
+
+    #[test]
+    fn the_end_of_an_alert_isnt_news_if_its_start_wasnt_wanted() {
+        let old = open(vec![
+            alert(1, Severity::Critical),
+            alert(2, Severity::Warning),
+        ]);
+        let new = Alerts {
+            open: vec![],
+            resolved: vec![
+                alert(1, Severity::Critical).resolved(now(), None),
+                alert(2, Severity::Warning).resolved(now(), None),
+            ],
+        };
+        let warnings_and_resolved = NotifyWhen {
+            critical: false,
+            ..EVERYTHING
+        };
+        assert_eq!(
+            titles(&notices(&old, &new, warnings_and_resolved, now())),
+            ["🟢 Resolved: Rule 2"]
+        );
+        // Told it started, before critical ones were turned off, they hear it end.
+        let mut told = HashSet::from([1]);
+        let all = worked_out(&old.open, &new, warnings_and_resolved, now(), &mut told);
+        assert_eq!(titles(&all), ["🟢 Resolved: Rule 1", "🟢 Resolved: Rule 2"]);
+    }
+
+    #[test]
+    fn an_alert_that_ends_too_long_after_it_started_to_be_listed_is_notified() {
+        // The server lists only the latest ended alerts to have started, so a long
+        // one can end without being listed.
+        let full: Vec<ServerAlert> = (1000..)
+            .take(RESOLVED_LISTED)
+            .map(|id| alert(id, Severity::Warning).resolved(now(), None))
+            .collect();
+        let mut long = alert(1, Severity::Critical);
+        long.started_at -= TimeDelta::days(3);
+        long.breached_at -= TimeDelta::days(3);
+        // Started after the oldest listed, it would be listed had it ended, so it's
+        // gone, as when its host was deleted.
+        let mut gone = alert(2, Severity::Critical);
+        gone.started_at += TimeDelta::minutes(1);
+        let old = open(vec![long, gone]);
+        let new = Alerts {
+            open: vec![],
+            resolved: full.clone(),
+        };
+        let all = notices(&old, &new, EVERYTHING, now());
+        assert_eq!(titles(&all), ["🟢 Resolved: Rule 1"]);
+        assert_eq!(all[0].body, "Was: Alert 1\nLasted 3d");
+        // A list that isn't full has every alert that's ended.
+        let short = Alerts {
+            open: vec![],
+            resolved: full[1..].to_vec(),
+        };
+        assert!(notices(&old, &short, EVERYTHING, now()).is_empty());
     }
 
     #[test]

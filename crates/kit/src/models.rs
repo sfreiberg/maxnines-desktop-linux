@@ -106,6 +106,10 @@ impl ServerAlert {
     }
 }
 
+/// How many ended alerts `GET /api/v1/alerts` lists at most: the latest to have
+/// started.
+pub const RESOLVED_LISTED: usize = 200;
+
 /// What `GET /api/v1/alerts` returns.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Alerts {
