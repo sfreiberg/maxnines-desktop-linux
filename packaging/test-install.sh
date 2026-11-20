@@ -28,7 +28,8 @@ echo "ok: its menu entry and icon are in place"
 service=/usr/share/dbus-1/services/com.maxnines.Desktop.service
 grep -qx 'Name=com.maxnines.Desktop' "$service"
 program=$(sed -n 's/^Exec=\([^ ]*\) .*/\1/p' "$service")
-[ "$program" = "$(command -v maxnines-desktop)" ] || { echo "Its D-Bus service starts $program"; exit 1; }
+said=$("$program" --version) || { echo "Its D-Bus service starts $program, which doesn't run"; exit 1; }
+[ "$said" = "maxnines-desktop $version" ] || { echo "Its D-Bus service starts $program: $said"; exit 1; }
 echo "ok: D-Bus can start it"
 
 remove
