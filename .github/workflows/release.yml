@@ -9,8 +9,9 @@
 # their SHA256SUMS.
 #
 # Only a tag runs this, as it's the slow part: CI runs the tests on every pull
-# request. Starting it by hand from Actions runs everything but publishing, to try
-# a packaging change before a tag needs it.
+# request. A release runs them too, on the commit it releases, which nothing else
+# may have tested, and publishes only if they pass. Starting it by hand from Actions
+# runs everything but publishing, to try a packaging change before a tag needs it.
 name: Release
 
 on:
@@ -26,6 +27,10 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  tests:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
   check:
     name: Version
     runs-on: ubuntu-latest
@@ -120,7 +125,7 @@ jobs:
   publish:
     name: Publish the release
     if: github.ref_type == 'tag'
-    needs: [check, test-packages]
+    needs: [tests, check, test-packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
