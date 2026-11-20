@@ -446,8 +446,34 @@ fn escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::thread::JoinHandle;
+
     use super::*;
     use crate::http::fake::{Fake, answer};
+
+    /// Plays the browser on a thread of its own, started when the sign-in opens the
+    /// approval page, so what it checks fails the test once it's joined.
+    struct Browser(RefCell<Option<JoinHandle<()>>>);
+
+    impl Browser {
+        fn new() -> Self {
+            Self(RefCell::new(None))
+        }
+
+        fn start(&self, browse: impl FnOnce() + Send + 'static) {
+            let started = self.0.replace(Some(std::thread::spawn(browse)));
+            assert!(started.is_none(), "the approval page was opened twice");
+        }
+
+        /// Waits for it to finish, failing if anything it checked did.
+        fn finished(&self) {
+            let browser = self.0.take().expect("the approval page was never opened");
+            if let Err(panic) = browser.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
 
     fn server() -> ServerAddress {
         ServerAddress::parse("https://monitor.example.com").unwrap()
@@ -556,7 +582,8 @@ mod tests {
         }));
         let endpoints = SignInEndpoints::new(server(), fake.clone());
         // Plays the browser: asks for an icon first, then comes back with the code.
-        let browser = |url: &str| {
+        let browser = Browser::new();
+        let open = |url: &str| {
             let query = url.split_once('?').unwrap().1;
             let fields: Vec<(String, String)> = serde_urlencoded::from_str(query).unwrap();
             let field = |name: &str| {
@@ -569,7 +596,7 @@ mod tests {
             };
             let back = field("redirect_uri");
             let state = field("state");
-            std::thread::spawn(move || {
+            browser.start(move || {
                 let address = back
                     .trim_start_matches("http://")
                     .trim_end_matches("/callback")
@@ -589,11 +616,12 @@ mod tests {
         let tokens = through_browser(
             &endpoints,
             "laptop",
-            &browser,
+            &open,
             &AtomicBool::new(false),
             Duration::from_secs(10),
         )
         .unwrap();
+        browser.finished();
         assert_eq!(tokens.user, "sam@example.com");
         let sent = fake.sent();
         let Body::Form(form) = &sent[0].body else {
@@ -614,7 +642,8 @@ mod tests {
             )
         }));
         let endpoints = SignInEndpoints::new(server(), fake);
-        let browser = |url: &str| {
+        let browser = Browser::new();
+        let open = |url: &str| {
             let query = url.split_once('?').unwrap().1;
             let fields: Vec<(String, String)> = serde_urlencoded::from_str(query).unwrap();
             let field = |name: &str| {
@@ -630,7 +659,7 @@ mod tests {
                 .trim_end_matches("/callback")
                 .to_string();
             let state = field("state");
-            std::thread::spawn(move || {
+            browser.start(move || {
                 // Far more than are read at once, open and silent, and one that
                 // starts a request and never finishes it.
                 let idle: Vec<TcpStream> = (0..MOST_WAITING * 3)
@@ -653,11 +682,12 @@ mod tests {
         let tokens = through_browser(
             &endpoints,
             "laptop",
-            &browser,
+            &open,
             &AtomicBool::new(false),
             Duration::from_secs(10),
         )
         .unwrap();
+        browser.finished();
         assert_eq!(tokens.refresh_token, "r");
     }
 
