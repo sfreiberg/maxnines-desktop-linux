@@ -211,6 +211,7 @@ pub fn start(app: &adw::Application) -> Shared {
             eprintln!("no tray to show the icon in ({error}), so closing the window quits")
         }
     }
+    notify::learn_how_bodies_are_read();
 
     let listening = store.clone();
     glib::spawn_future_local(async move {
