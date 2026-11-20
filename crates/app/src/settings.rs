@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use gtk::glib;
 use maxnines_desktop_kit::NotifyWhen;
 use serde::{Deserialize, Serialize};
 
@@ -37,16 +38,9 @@ impl Default for Settings {
     }
 }
 
-/// `$XDG_CONFIG_HOME`, or `~/.config`.
+/// `$XDG_CONFIG_HOME`, or `~/.config`, as GLib finds them.
 pub fn config_home() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
-}
-
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+    glib::user_config_dir()
 }
 
 fn path(config_home: &Path) -> PathBuf {
@@ -97,6 +91,8 @@ impl Settings {
 /// Starting when the person signs in, through a desktop entry in
 /// `~/.config/autostart`, as every desktop reads.
 pub mod autostart {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
     fn path(config_home: &Path) -> PathBuf {
@@ -113,7 +109,21 @@ pub mod autostart {
     pub fn set(on: bool) -> Result<(), String> {
         // The program as it was started, so a copy run from anywhere starts itself.
         let program = std::env::current_exe().map_err(|error| error.to_string())?;
-        set_in(&super::config_home(), on, &program).map_err(|error| error.to_string())
+        set_in(&super::config_home(), on, &program_now(program)).map_err(|error| error.to_string())
+    }
+
+    /// The program at the path `started` was started from. Linux names a program
+    /// that's been replaced since it started, as upgrading its package while it runs
+    /// does, by its path with ` (deleted)` after it, and the one now at that path is
+    /// the one to start.
+    pub(super) fn program_now(started: PathBuf) -> PathBuf {
+        if started.exists() {
+            return started;
+        }
+        match started.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+            Some(path) => PathBuf::from(OsStr::from_bytes(path)),
+            None => started,
+        }
     }
 
     pub(super) fn set_in(config_home: &Path, on: bool, program: &Path) -> std::io::Result<()> {
@@ -229,6 +239,21 @@ mod tests {
         assert!(!autostart::is_on_in(home.path()));
         // Turning off what's already off is fine.
         autostart::set_in(home.path(), false, program).unwrap();
+    }
+
+    #[test]
+    fn a_program_replaced_since_it_started_is_started_from_its_path() {
+        let folder = tempfile::tempdir().unwrap();
+        let program = folder.path().join("maxnines-desktop");
+        std::fs::write(&program, "").unwrap();
+        // As Linux names the program it's running once an upgrade has replaced it.
+        let replaced = folder.path().join("maxnines-desktop (deleted)");
+        assert_eq!(autostart::program_now(replaced), program);
+        assert_eq!(autostart::program_now(program.clone()), program);
+        // One really called that is left as it is.
+        let named = folder.path().join("odd (deleted)");
+        std::fs::write(&named, "").unwrap();
+        assert_eq!(autostart::program_now(named.clone()), named);
     }
 
     #[test]

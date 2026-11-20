@@ -1,8 +1,9 @@
 //! The window: what's firing, what resolved lately and the silences running, on one
 //! page, and the settings on another.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use chrono::{DateTime, Utc};
@@ -161,6 +162,14 @@ impl Ui {
         // Starting at sign-in.
         let startup = adw::PreferencesGroup::new();
         let at_login = switch_row(&startup, "Open at login", autostart::is_on());
+        let at_login_problem = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["error"])
+            .margin_top(6)
+            .visible(false)
+            .build();
+        startup.add(&at_login_problem);
         settings.add(&startup);
 
         let about = adw::PreferencesGroup::new();
@@ -261,12 +270,35 @@ impl Ui {
         connect_notify_switch(&resolved, store, |settings, on| {
             settings.notify_resolved = on
         });
+        // Flipped back if it couldn't be changed, saying why, so the switch says
+        // what will happen at login. Flipping it back changes nothing itself.
+        let flipping_back = Rc::new(Cell::new(false));
         at_login.connect_state_set(move |switch, on| {
-            if let Err(error) = autostart::set(on) {
-                eprintln!("couldn't change opening at login: {error}");
+            if flipping_back.get() {
+                switch.set_state(on);
                 return glib::Propagation::Stop;
             }
-            switch.set_state(on);
+            match autostart::set(on) {
+                Ok(()) => {
+                    at_login_problem.set_visible(false);
+                    switch.set_state(on);
+                }
+                Err(error) => {
+                    eprintln!("couldn't change opening at login: {error}");
+                    at_login_problem.set_label(&format!(
+                        "Couldn't turn opening at login {}: {error}",
+                        if on { "on" } else { "off" }
+                    ));
+                    at_login_problem.set_visible(true);
+                    let switch = switch.clone();
+                    let flipping_back = flipping_back.clone();
+                    glib::idle_add_local_once(move || {
+                        flipping_back.set(true);
+                        switch.set_active(!on);
+                        flipping_back.set(false);
+                    });
+                }
+            }
             glib::Propagation::Stop
         });
 
