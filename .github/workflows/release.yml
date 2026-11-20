@@ -93,7 +93,8 @@ jobs:
           folder="maxnines-desktop-$VERSION"
           mkdir -p "tarball/$folder"
           cp target/release/maxnines-desktop packaging/com.maxnines.Desktop.desktop \
-            packaging/com.maxnines.Desktop.svg README.md LICENSE "tarball/$folder/"
+            packaging/com.maxnines.Desktop.service packaging/com.maxnines.Desktop.svg \
+            README.md LICENSE "tarball/$folder/"
           tar -czf "packages/maxnines-desktop-$VERSION-$ARCH-linux.tar.gz" -C tarball "$folder"
           ls -l packages
       - uses: actions/upload-artifact@v4

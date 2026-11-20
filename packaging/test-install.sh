@@ -23,6 +23,13 @@ echo "ok: it runs, with the libraries it needs installed"
 desktop-file-validate /usr/share/applications/com.maxnines.Desktop.desktop
 test -f /usr/share/icons/hicolor/scalable/apps/com.maxnines.Desktop.svg
 echo "ok: its menu entry and icon are in place"
+# The desktop starts it through D-Bus, as when a notification is pressed with the app
+# not running, so the service has to start the program that's installed.
+service=/usr/share/dbus-1/services/com.maxnines.Desktop.service
+grep -qx 'Name=com.maxnines.Desktop' "$service"
+program=$(sed -n 's/^Exec=\([^ ]*\) .*/\1/p' "$service")
+[ "$program" = "$(command -v maxnines-desktop)" ] || { echo "Its D-Bus service starts $program"; exit 1; }
+echo "ok: D-Bus can start it"
 
 remove
 if command -v maxnines-desktop >/dev/null; then echo "Removing it left it behind"; exit 1; fi

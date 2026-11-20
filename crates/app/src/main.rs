@@ -67,8 +67,9 @@ fn main() -> glib::ExitCode {
             let store = shared.borrow().clone();
             match store {
                 Some(store) => store::pressed(&store, pressed),
-                // Pressed as it started the app: it starts as if opened, and what
-                // was pressed, from a run before, is for a connection gone.
+                // Pressed with the app not running, so the desktop started it through
+                // D-Bus to say so: it starts as if opened, and what was pressed, from
+                // a run before, is for a connection gone.
                 None => app.activate(),
             }
         });
@@ -87,6 +88,14 @@ fn main() -> glib::ExitCode {
         }
         *shared.borrow_mut() = Some(store);
     });
-    // Its own arguments are read above, so GTK isn't given ones it doesn't know.
-    app.run_with_args(&["maxnines-desktop"])
+    // Its own arguments are read above, so GTK isn't given ones it doesn't know. Only
+    // the one D-Bus starts it with is passed on: started that way, by a notification
+    // pressed while it wasn't running or by a desktop that opens apps through D-Bus,
+    // it waits to be told what for rather than opening its window.
+    const SERVICE: &str = "--gapplication-service";
+    let mut arguments = vec!["maxnines-desktop"];
+    if std::env::args().any(|argument| argument == SERVICE) {
+        arguments.push(SERVICE);
+    }
+    app.run_with_args(&arguments)
 }
